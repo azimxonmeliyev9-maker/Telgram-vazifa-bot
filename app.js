@@ -118,9 +118,34 @@ document.addEventListener('DOMContentLoaded', () => {
     const taskForm = document.getElementById('task-form');
 
     // ----------------------------------------------------------------------
-    // 3. AUTHENTICATION LOGIC
+    // 3. AUTHENTICATION LOGIC & TELEGRAM WEB APP
     // ----------------------------------------------------------------------
+    function initTelegramWebApp() {
+        if (window.Telegram && window.Telegram.WebApp) {
+            try {
+                const tg = window.Telegram.WebApp;
+                tg.ready();
+                tg.expand();
+
+                if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+                    const tgUser = tg.initDataUnsafe.user;
+                    const nameDisplay = document.getElementById('user-display-name');
+                    if (nameDisplay) {
+                        nameDisplay.textContent = tgUser.first_name || tgUser.username || 'Telegram User';
+                    }
+                    const loginUserInput = document.getElementById('login-user');
+                    if (loginUserInput) {
+                        loginUserInput.value = tgUser.username || tgUser.first_name || 'admin';
+                    }
+                }
+            } catch (err) {
+                console.log("Telegram WebApp init error:", err);
+            }
+        }
+    }
+
     function initAuth() {
+        initTelegramWebApp();
         if (appState.isLoggedIn) {
             loginScreen.classList.add('hidden');
             appScreen.classList.remove('hidden');
