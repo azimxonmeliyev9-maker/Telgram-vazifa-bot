@@ -39,7 +39,15 @@ module.exports = async (req, res) => {
         return res.status(200).send(`Telegram Bot Webhook is Active (24/7)! Token: 8699086796`);
     }
 
-    const update = req.body;
+    let update = req.body;
+    if (typeof update === 'string') {
+        try {
+            update = JSON.parse(update);
+        } catch (e) {
+            console.error("JSON parse error:", e);
+        }
+    }
+
     if (!update || !update.message) {
         return res.status(200).send('OK');
     }
