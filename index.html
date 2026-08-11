@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vazifa va Harajatlar Boshqaruvi</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Canvas Confetti CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-theme">
+
+    <!-- LOGIN SCREEN -->
+    <div id="login-screen" class="login-wrapper">
+        <div class="login-bg-glow glow-1"></div>
+        <div class="login-bg-glow glow-2"></div>
+        <div class="login-card glass-panel">
+            <div class="login-header">
+                <div class="app-icon">
+                    <i class="fa-solid fa-wallet-membership"></i>
+                </div>
+                <h2>Xush Kelibsiz!</h2>
+                <p>Vazifalar va Harajatlar boshqaruvi tizimiga kirish</p>
+            </div>
+            <form id="login-form" autocomplete="off">
+                <div class="input-group">
+                    <label for="login-user"><i class="fa-solid fa-user"></i> Login / Foydalanuvchi</label>
+                    <input type="text" id="login-user" value="admin" placeholder="Masalan: admin" required>
+                </div>
+                <div class="input-group">
+                    <label for="login-pass"><i class="fa-solid fa-lock"></i> Parol</label>
+                    <div class="pass-input-box">
+                        <input type="password" id="login-pass" value="123" placeholder="Parolni kiriting" required>
+                        <button type="button" id="toggle-pass-btn" class="pass-toggle"><i class="fa-regular fa-eye"></i></button>
+                    </div>
+                    <span class="hint-text"><i class="fa-solid fa-circle-info"></i> Standart parol: <strong>123</strong></span>
+                </div>
+                <div id="login-error" class="error-msg hidden">
+                    <i class="fa-solid fa-triangle-exclamation"></i> Login yoki parol xato!
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">
+                    <span>Tizimga Kirish</span>
+                    <i class="fa-solid fa-arrow-right-to-bracket"></i>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- MAIN APP SCREEN -->
+    <div id="app-screen" class="app-container hidden">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar glass-panel">
+            <div class="brand">
+                <div class="brand-icon">
+                    <i class="fa-solid fa-bolt-lightning"></i>
+                </div>
+                <div class="brand-text">
+                    <h1>Vazifa & Harajat</h1>
+                    <span>Boshqaruv Markazi</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" data-tab="dashboard">
+                    <i class="fa-solid fa-chart-pie"></i>
+                    <span>Boshqaruv Paneli</span>
+                </button>
+                <button class="nav-item" data-tab="expenses">
+                    <i class="fa-solid fa-wallet"></i>
+                    <span>Harajatlarim</span>
+                </button>
+                <button class="nav-item" data-tab="tasks">
+                    <i class="fa-solid fa-list-check"></i>
+                    <span>Kundalik Vazifalar</span>
+                </button>
+                <button class="nav-item" data-tab="settings">
+                    <i class="fa-solid fa-sliders"></i>
+                    <span>Sozlamalar</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="user-profile">
+                    <div class="avatar">
+                        <i class="fa-solid fa-user-gear"></i>
+                    </div>
+                    <div class="user-info">
+                        <span id="user-display-name" class="name">Admin</span>
+                        <span class="status"><i class="fa-solid fa-circle"></i> Onlayn</span>
+                    </div>
+                </div>
+                <button id="logout-btn" class="btn-icon danger-icon" title="Tizimdan chiqish">
+                    <i class="fa-solid fa-right-from-bracket"></i>
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header TopBar -->
+            <header class="topbar glass-panel">
+                <div class="topbar-left">
+                    <h2 id="page-title">Boshqaruv Paneli</h2>
+                    <p id="current-date-display" class="date-subtitle">11-Avgust, 2026</p>
+                </div>
+                <div class="topbar-right">
+                    <button id="quick-add-expense-btn" class="btn btn-secondary">
+                        <i class="fa-solid fa-plus"></i> Harajat
+                    </button>
+                    <button id="quick-add-task-btn" class="btn btn-primary">
+                        <i class="fa-solid fa-plus"></i> Vazifa
+                    </button>
+                </div>
+            </header>
+
+            <!-- TAB 1: DASHBOARD -->
+            <section id="tab-dashboard" class="tab-page active">
+                <div class="metrics-grid">
+                    <div class="metric-card glass-panel gradient-border">
+                        <div class="metric-header">
+                            <span>Jami Harajat (Bu oy)</span>
+                            <div class="icon-box expense-bg"><i class="fa-solid fa-arrow-down-long"></i></div>
+                        </div>
+                        <div class="metric-body">
+                            <h3 id="dash-total-expense">0 UZS</h3>
+                            <p class="metric-sub" id="dash-expense-count">0 ta bitim</p>
+                        </div>
+                    </div>
+
+                    <div class="metric-card glass-panel gradient-border">
+                        <div class="metric-header">
+                            <span>Oylik Budjet Limit</span>
+                            <div class="icon-box budget-bg"><i class="fa-solid fa-piggy-bank"></i></div>
+                        </div>
+                        <div class="metric-body">
+                            <h3 id="dash-budget-display">5,000,000 UZS</h3>
+                            <div class="progress-bar-container">
+                                <div id="dash-budget-progress" class="progress-bar" style="width: 0%;"></div>
+                            </div>
+                            <p class="metric-sub" id="dash-budget-remaining">Qolgan: 5,000,000 UZS</p>
+                        </div>
+                    </div>
+
+                    <div class="metric-card glass-panel gradient-border">
+                        <div class="metric-header">
+                            <span>Bajarilgan Vazifalar</span>
+                            <div class="icon-box task-bg"><i class="fa-solid fa-check-double"></i></div>
+                        </div>
+                        <div class="metric-body">
+                            <h3 id="dash-task-ratio">0 / 0</h3>
+                            <div class="progress-bar-container">
+                                <div id="dash-task-progress" class="progress-bar accent-bg" style="width: 0%;"></div>
+                            </div>
+                            <p class="metric-sub" id="dash-task-percent">0% bajarildi</p>
+                        </div>
+                    </div>
+
+                    <div class="metric-card glass-panel gradient-border">
+                        <div class="metric-header">
+                            <span>Bugungi Vazifalar</span>
+                            <div class="icon-box today-bg"><i class="fa-solid fa-calendar-day"></i></div>
+                        </div>
+                        <div class="metric-body">
+                            <h3 id="dash-today-tasks">0 ta</h3>
+                            <p class="metric-sub" id="dash-pending-tasks">Kutilayotgan: 0 ta</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Charts Section -->
+                <div class="dashboard-grid mt-4">
+                    <div class="chart-card glass-panel">
+                        <div class="card-header">
+                            <h3><i class="fa-solid fa-chart-pie"></i> Harajatlar Toifalari</h3>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="expenseCategoryChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="chart-card glass-panel">
+                        <div class="card-header">
+                            <h3><i class="fa-solid fa-chart-column"></i> So'nggi Vazifalar va Progress</h3>
+                        </div>
+                        <div class="recent-tasks-preview">
+                            <ul id="dash-recent-tasks-list" class="dash-list">
+                                <!-- Dynamic recent tasks -->
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 2: HARAJATLAR (EXPENSES) -->
+            <section id="tab-expenses" class="tab-page">
+                <div class="section-actions glass-panel">
+                    <div class="search-filter-box">
+                        <div class="search-input">
+                            <i class="fa-solid fa-magnifying-glass"></i>
+                            <input type="text" id="expense-search" placeholder="Harajat nomi bo'yicha qidirish...">
+                        </div>
+                        <select id="expense-filter-category" class="custom-select">
+                            <option value="all">Barcha Toifalar</option>
+                            <option value="Oziq-ovqat">🍎 Oziq-ovqat</option>
+                            <option value="Transport">🚕 Transport</option>
+                            <option value="Kommunal">💡 Kommunal / Uy</option>
+                            <option value="O'yin-kulgi">🎬 O'yin-kulgi</option>
+                            <option value="Xaridlar">🛍️ Xaridlar</option>
+                            <option value="Sog'liq">💊 Sog'liqni saqlash</option>
+                            <option value="Boshqa">📦 Boshqa</option>
+                        </select>
+                    </div>
+                    <button id="open-expense-modal" class="btn btn-primary">
+                        <i class="fa-solid fa-plus"></i> Yangi Harajat
+                    </button>
+                </div>
+
+                <!-- Expense Cards / Table -->
+                <div class="glass-panel mt-4 overflow-hidden">
+                    <table class="custom-table">
+                        <thead>
+                            <tr>
+                                <th>Harajat Nomi</th>
+                                <th>Toifa</th>
+                                <th>Sana</th>
+                                <th>To'lov Usuli</th>
+                                <th>Summa (UZS)</th>
+                                <th>Amallar</th>
+                            </tr>
+                        </thead>
+                        <tbody id="expenses-table-body">
+                            <!-- Dynamic Expense rows -->
+                        </tbody>
+                    </table>
+                    <div id="expenses-empty-state" class="empty-state hidden">
+                        <i class="fa-solid fa-receipt"></i>
+                        <p>Hozircha hech qanday harajat kiritilmadi.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 3: KUNDALIK VAZIFALAR (TASKS) -->
+            <section id="tab-tasks" class="tab-page">
+                <div class="task-stats-banner glass-panel">
+                    <div class="banner-info">
+                        <h3><i class="fa-solid fa-bullseye"></i> Bugungi Mahsuldorlik</h3>
+                        <p id="task-quote">"Bugun qilgan kichik qadamingiz ertangi katta muvaffaqiyat poydevoridir!"</p>
+                    </div>
+                    <div class="banner-progress">
+                        <div class="banner-circle" id="banner-progress-circle">
+                            <span id="banner-progress-num">0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section-actions glass-panel mt-4">
+                    <div class="task-tabs">
+                        <button class="task-tab-btn active" data-filter="all">Barchasi</button>
+                        <button class="task-tab-btn" data-filter="pending">Kutilmoqda</button>
+                        <button class="task-tab-btn" data-filter="completed">Bajarildi</button>
+                    </div>
+                    <button id="open-task-modal" class="btn btn-primary">
+                        <i class="fa-solid fa-plus"></i> Yangi Vazifa Qo'shish
+                    </button>
+                </div>
+
+                <!-- Tasks List Grid -->
+                <div class="tasks-container mt-4">
+                    <div id="tasks-list" class="tasks-grid">
+                        <!-- Dynamic Tasks -->
+                    </div>
+                    <div id="tasks-empty-state" class="empty-state hidden">
+                        <i class="fa-solid fa-clipboard-check"></i>
+                        <p>Vazifalar ro'yxati bo'sh!</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 4: SOZLAMALAR (SETTINGS) -->
+            <section id="tab-settings" class="tab-page">
+                <div class="settings-grid">
+                    <div class="setting-card glass-panel">
+                        <h3><i class="fa-solid fa-key"></i> Kirish Parolini O'zgartirish</h3>
+                        <form id="change-pass-form">
+                            <div class="input-group mt-3">
+                                <label>Hozirgi Parol</label>
+                                <input type="password" id="curr-pass-input" placeholder="Standart: 123" required>
+                            </div>
+                            <div class="input-group">
+                                <label>Yangi Parol</label>
+                                <input type="password" id="new-pass-input" placeholder="Yangi parol" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary">Parolni Saqlash</button>
+                        </form>
+                    </div>
+
+                    <div class="setting-card glass-panel">
+                        <h3><i class="fa-solid fa-piggy-bank"></i> Oylik Budjet Limitini O'zgartirish</h3>
+                        <form id="change-budget-form">
+                            <div class="input-group mt-3">
+                                <label>Oylik Budjet (UZS)</label>
+                                <input type="number" id="budget-limit-input" value="5000000" step="100000" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary">Budjetni Saqlash</button>
+                        </form>
+                    </div>
+
+                    <div class="setting-card glass-panel">
+                        <h3><i class="fa-solid fa-database"></i> Ma'lumotlarni Boshqarish (Backup)</h3>
+                        <p class="sub-text">Barcha harajatlar va vazifalar ma'lumotlarini faylga saqlang yoki qayta tiklang.</p>
+                        <div class="btn-group mt-3">
+                            <button id="export-data-btn" class="btn btn-secondary">
+                                <i class="fa-solid fa-download"></i> Eksport (JSON)
+                            </button>
+                            <label for="import-file-input" class="btn btn-secondary">
+                                <i class="fa-solid fa-upload"></i> Import Qilish
+                            </label>
+                            <input type="file" id="import-file-input" accept=".json" class="hidden">
+                        </div>
+                    </div>
+
+                    <div class="setting-card glass-panel danger-card">
+                        <h3><i class="fa-solid fa-trash-can"></i> Tizimni Qayta Tiklash (Reset)</h3>
+                        <p class="sub-text">Barcha harajatlar va vazifalarni o'chirib tashlash.</p>
+                        <button id="reset-all-btn" class="btn btn-danger mt-3">
+                            <i class="fa-solid fa-triangle-exclamation"></i> Barcha Ma'lumotlarni O'chirish
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- MODAL: ADD EXPENSE -->
+    <div id="expense-modal" class="modal-overlay hidden">
+        <div class="modal-card glass-panel">
+            <div class="modal-header">
+                <h3>Yangi Harajat Qo'shish</h3>
+                <button class="close-modal-btn" data-modal="expense-modal">&times;</button>
+            </div>
+            <form id="expense-form">
+                <div class="input-group">
+                    <label>Harajat Nomi</label>
+                    <input type="text" id="exp-title" placeholder="Masalan: Tushlik yoki Benzina" required>
+                </div>
+                <div class="input-group-row">
+                    <div class="input-group">
+                        <label>Summa (UZS)</label>
+                        <input type="number" id="exp-amount" placeholder="50000" min="1" required>
+                    </div>
+                    <div class="input-group">
+                        <label>Toifa</label>
+                        <select id="exp-category" class="custom-select" required>
+                            <option value="Oziq-ovqat">🍎 Oziq-ovqat</option>
+                            <option value="Transport">AX Transport</option>
+                            <option value="Kommunal">💡 Kommunal / Uy</option>
+                            <option value="O'yin-kulgi">🎬 O'yin-kulgi</option>
+                            <option value="Xaridlar">🛍️ Xaridlar</option>
+                            <option value="Sog'liq">💊 Sog'liqni saqlash</option>
+                            <option value="Boshqa">📦 Boshqa</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="input-group-row">
+                    <div class="input-group">
+                        <label>Sana</label>
+                        <input type="date" id="exp-date" required>
+                    </div>
+                    <div class="input-group">
+                        <label>To'lov Usuli</label>
+                        <select id="exp-payment" class="custom-select">
+                            <option value="Naqd">💵 Naqd pul</option>
+                            <option value="Karta">💳 Bank Kartasi</option>
+                            <option value="Click/Payme">📱 Click / Payme / Uzum</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary close-modal-btn" data-modal="expense-modal">Bekor qilish</button>
+                    <button type="submit" class="btn btn-primary">Saqlash</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: ADD TASK -->
+    <div id="task-modal" class="modal-overlay hidden">
+        <div class="modal-card glass-panel">
+            <div class="modal-header">
+                <h3>Yangi Vazifa Qo'shish</h3>
+                <button class="close-modal-btn" data-modal="task-modal">&times;</button>
+            </div>
+            <form id="task-form">
+                <div class="input-group">
+                    <label>Vazifa Sarlavhasi</label>
+                    <input type="text" id="task-title" placeholder="Masalan: Kitob o'qish yoki Hisobot tayyorlash" required>
+                </div>
+                <div class="input-group-row">
+                    <div class="input-group">
+                        <label>Muhimlik Darajasi</label>
+                        <select id="task-priority" class="custom-select" required>
+                            <option value="high">🔴 Yuqori Shoshilinch</option>
+                            <option value="medium" selected>🟡 O'rta Muhim</option>
+                            <option value="low">🟢 Odatiy / Past</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label>Toifa</label>
+                        <select id="task-category" class="custom-select">
+                            <option value="Ish">💼 Ish</option>
+                            <option value="O'qish">📚 O'qish</option>
+                            <option value="Shaxsiy">🏠 Shaxsiy</option>
+                            <option value="Sport">🏋️ Sport / Salomatlik</option>
+                            <option value="Boshqa">📌 Boshqa</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>Muddati (Sana)</label>
+                    <input type="date" id="task-date" required>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary close-modal-btn" data-modal="task-modal">Bekor qilish</button>
+                    <button type="submit" class="btn btn-primary">Vazifani Saqlash</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Toast Notification Widget -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>
