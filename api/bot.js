@@ -296,7 +296,24 @@ module.exports = async (req, res) => {
 
         if (text === '📈 Statistika' || text === '/stat') {
             user.state = null;
-            await sendStatistics(chatId, firstName, user);
+            // Davr tanlash tugmalari chiqar
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `📈 <b>Statistika</b>\n\nQaysi davr uchun ko'rmoqchisiz?`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '📅 Haftalik', callback_data: 'stat_week' },
+                            { text: '🗓 Oylik',    callback_data: 'stat_month' },
+                            { text: '📆 Yillik',   callback_data: 'stat_year' }
+                        ],
+                        [
+                            { text: '🕐 Bugungi',  callback_data: 'stat_today' }
+                        ]
+                    ]
+                }
+            });
             return res.status(200).send('OK');
         }
 
@@ -485,7 +502,21 @@ async function handleCallbackQuery(cq) {
             message_id: cq.message.message_id
         });
     }
+
+    // Statistika davr tugmalari
+    if (data === 'stat_today' || data === 'stat_week' || data === 'stat_month' || data === 'stat_year') {
+        const periodMap = { stat_today: 'today', stat_week: 'week', stat_month: 'month', stat_year: 'year' };
+        const labelMap = { stat_today: '🕐 Bugungi', stat_week: '📅 Haftalik', stat_month: '🗓 Oylik', stat_year: '📆 Yillik' };
+        await sendTelegramApi('answerCallbackQuery', {
+            callback_query_id: cq.id,
+            text: `${labelMap[data]} statistika yuklanmoqda...`,
+            show_alert: false
+        });
+        const firstName = cq.from ? cq.from.first_name : 'Foydalanuvchi';
+        await sendStatistics(chatId, firstName, user, periodMap[data]);
+    }
 }
+
 
 // ============================================================
 // DAILY REPORT
@@ -561,10 +592,11 @@ async function sendTaskList(chatId, firstName, user) {
 }
 
 // ============================================================
-// STATISTICS
+// STATISTICS — Davr bo'yicha
 // ============================================================
-async function sendStatistics(chatId, firstName, user) {
+async function sendStatistics(chatId, firstName, user, period = 'today') {
     const expenses = user.expenses;
+
     if (expenses.length === 0) {
         await sendTelegramApi('sendMessage', {
             chat_id: chatId,
@@ -575,30 +607,88 @@ async function sendStatistics(chatId, firstName, user) {
         return;
     }
 
-    const today = getTodayDate();
-    const todayTotal = expenses.filter(e => e.dateKey === today).reduce((s,e)=>s+e.amount,0);
-    const allTotal = expenses.reduce((s,e)=>s+e.amount,0);
-    const totalCount = expenses.length;
+    const now = new Date();
+    let filtered = [];
+    let periodLabel = '';
 
-    // Toifa bo'yicha statistika
+    if (period === 'today') {
+        const today = getTodayDate();
+        filtered = expenses.filter(e => e.dateKey === today);
+        periodLabel = '🕐 Bugungi';
+    } else if (period === 'week') {
+        const weekAgo = new Date(now);
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        filtered = expenses.filter(e => new Date(e.dateKey) >= weekAgo);
+        periodLabel = '📅 Haftalik (oxirgi 7 kun)';
+    } else if (period === 'month') {
+        const monthAgo = new Date(now);
+        monthAgo.setDate(1); // Shu oyning 1-kuni
+        const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+        filtered = expenses.filter(e => e.dateKey && e.dateKey.startsWith(monthKey));
+        periodLabel = `🗓 Oylik (${now.toLocaleDateString('uz-UZ', {month:'long', year:'numeric'})})`;
+    } else if (period === 'year') {
+        const yearStr = String(now.getFullYear());
+        filtered = expenses.filter(e => e.dateKey && e.dateKey.startsWith(yearStr));
+        periodLabel = `📆 Yillik (${now.getFullYear()})`;
+    }
+
+    if (filtered.length === 0) {
+        await sendTelegramApi('sendMessage', {
+            chat_id: chatId,
+            text: `📈 <b>${periodLabel}</b>\n\n<i>Bu davr uchun harajat topilmadi.</i>`,
+            parse_mode: 'HTML',
+            reply_markup: MAIN_KEYBOARD
+        });
+        return;
+    }
+
+    const totalSum = filtered.reduce((s, e) => s + e.amount, 0);
+    const totalCount = filtered.length;
+
+    // Kunlik o'rtacha
+    const uniqueDays = new Set(filtered.map(e => e.dateKey)).size;
+    const avgDaily = uniqueDays > 0 ? Math.round(totalSum / uniqueDays) : totalSum;
+
+    // Toifa bo'yicha
     const catMap = {};
-    expenses.forEach(e => {
-        catMap[e.description] = (catMap[e.description] || 0) + e.amount;
+    filtered.forEach(e => {
+        const key = e.description || 'Boshqa';
+        catMap[key] = (catMap[key] || 0) + e.amount;
     });
-    const topCats = Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,3);
+    const topCats = Object.entries(catMap).sort((a,b) => b[1]-a[1]).slice(0, 5);
     let catText = '';
     topCats.forEach(([desc, sum], i) => {
-        catText += `\n${i+1}. ${escapeHtml(desc)} — <b>${formatMoney(sum)}</b>`;
+        const percent = Math.round((sum / totalSum) * 100);
+        const bar = '█'.repeat(Math.round(percent/10)) + '░'.repeat(10 - Math.round(percent/10));
+        catText += `\n${i+1}. ${escapeHtml(desc)}\n   ${bar} ${percent}%  <b>${formatMoney(sum)}</b>\n`;
     });
 
-    // O'rtacha kunlik
-    const uniqueDays = new Set(expenses.map(e => e.dateKey)).size;
-    const avgDaily = uniqueDays > 0 ? Math.round(allTotal / uniqueDays) : 0;
+    // Eng ko'p harajat qilingan kun
+    const dayMap = {};
+    filtered.forEach(e => {
+        dayMap[e.dateKey] = (dayMap[e.dateKey] || 0) + e.amount;
+    });
+    const topDay = Object.entries(dayMap).sort((a,b)=>b[1]-a[1])[0];
+    const topDayText = topDay
+        ? `📅 <b>Eng yuqori kun:</b> ${topDay[0]} — <code>${formatMoney(topDay[1])}</code>`
+        : '';
 
     await sendTelegramApi('sendMessage', {
         chat_id: chatId,
-        text: `📈 <b>STATISTIKA</b>\n👤 <b>${escapeHtml(firstName)}</b>\n\n💸 <b>Bugungi harajat:</b> <code>${formatMoney(todayTotal)}</code>\n💰 <b>Jami harajat:</b> <code>${formatMoney(allTotal)}</code>\n📊 <b>Jami bitim:</b> ${totalCount} ta\n📅 <b>O'rtacha kunlik:</b> <code>${formatMoney(avgDaily)}</code>\n\n🏆 <b>Eng ko'p sarflangan:</b>${catText}`,
+        text: `📈 <b>STATISTIKA — ${periodLabel}</b>\n👤 <b>${escapeHtml(firstName)}</b>\n\n💰 <b>Jami harajat:</b> <code>${formatMoney(totalSum)}</code>\n📊 <b>Jami bitim:</b> ${totalCount} ta\n📆 <b>Kun soni:</b> ${uniqueDays} kun\n📉 <b>Kunlik o'rtacha:</b> <code>${formatMoney(avgDaily)}</code>\n${topDayText}\n\n🏆 <b>Toifalar bo'yicha:</b>\n${catText}`,
         parse_mode: 'HTML',
-        reply_markup: MAIN_KEYBOARD
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '🕐 Bugungi', callback_data: 'stat_today' },
+                    { text: '📅 Haftalik', callback_data: 'stat_week' }
+                ],
+                [
+                    { text: '🗓 Oylik', callback_data: 'stat_month' },
+                    { text: '📆 Yillik', callback_data: 'stat_year' }
+                ]
+            ]
+        }
     });
 }
+
