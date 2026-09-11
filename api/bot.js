@@ -391,21 +391,77 @@ module.exports = async (req, res) => {
             user.state = 'awaiting_task_priority';
             await sendTelegramApi('sendMessage', {
                 chat_id: chatId,
-                text: `📝 <b>Vazifa:</b> ${escapeHtml(text)}\n\n⚡ <b>Muhimlik darajasi:</b>`,
+                text: `📝 <b>Vazifa:</b> <i>${escapeHtml(text)}</i>\n\n⚡ <b>Qay darajada zarur?</b>`,
                 parse_mode: 'HTML',
-                reply_markup: PRIORITY_KEYBOARD
+                reply_markup: {
+                    keyboard: [
+                        ['🔴 Juda Zarur (Bugun hal qilinishi shart)'],
+                        ['🟡 Muhim (Imkon topilsa bajarilsin)'],
+                        ['🟢 Oddiy (Ertaga ham bo\'ladi)']
+                    ],
+                    resize_keyboard: true,
+                    one_time_keyboard: true
+                }
             });
             return res.status(200).send('OK');
         }
 
         // Vazifa muhimligi
         if (user.state === 'awaiting_task_priority') {
-            let priority = 'medium', emoji = '🟡', label = "O'rta";
-            if (text.includes('Yuqori') || text.includes('🔴')) { priority='high'; emoji='🔴'; label='Yuqori'; }
-            else if (text.includes('Past') || text.includes('🟢')) { priority='low'; emoji='🟢'; label='Past'; }
+            let priority = 'medium', emoji = '🟡', label = "Muhim";
+            if (text.includes('Juda Zarur') || text.includes('🔴')) { priority='high'; emoji='🔴'; label='Juda Zarur'; }
+            else if (text.includes('Oddiy') || text.includes('🟢')) { priority='low'; emoji='🟢'; label='Oddiy'; }
 
+            user.pendingTaskPriority = { priority, emoji, label };
+            user.state = 'awaiting_task_time';
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `${emoji} <b>${label}</b>\n\n🕐 <b>Vazifani qaysi soatga bajarish kerak?</b>\n\nVaqtni kiriting (24 soatlik format):\n<i>Masalan: 14:30 yoki 09:00</i>\n\nYoki «Bugun» yoki «Ertaga» tanlang:`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    keyboard: [
+                        ['⏰ 09:00', '⏰ 12:00', '⏰ 15:00'],
+                        ['⏰ 18:00', '⏰ 20:00', '⏰ 22:00'],
+                        ['📅 Muddatsiz (Eslatma yo\'q)']
+                    ],
+                    resize_keyboard: true,
+                    one_time_keyboard: true
+                }
+            });
+            return res.status(200).send('OK');
+        }
+
+        // Vazifa vaqti
+        if (user.state === 'awaiting_task_time') {
             const taskId = Date.now().toString();
             const taskTitle = user.pendingTaskTitle;
+            const { priority, emoji, label } = user.pendingTaskPriority || { priority:'medium', emoji:'🟡', label:"Muhim" };
+
+            // Vaqtni parse qilish
+            let deadlineTime = null;
+            let deadlineMinutes = null;
+            let timeDisplay = '📅 Muddatsiz';
+
+            if (text !== '📅 Muddatsiz (Eslatma yo\'q)') {
+                // "⏰ 14:30" yoki "14:30" formatidan vaqt ajratish
+                const timeMatch = text.replace('⏰', '').trim().match(/^(\d{1,2}):(\d{2})$/);
+                if (timeMatch) {
+                    const hours = parseInt(timeMatch[1]);
+                    const minutes = parseInt(timeMatch[2]);
+                    if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
+                        deadlineTime = `${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}`;
+                        deadlineMinutes = hours * 60 + minutes;
+                        timeDisplay = `🕐 ${deadlineTime}`;
+                    }
+                }
+            }
+
+            const now = new Date();
+            const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+            // Reminder vaqti: deadline'dan 30 daqiqa oldin
+            let reminderMinutes = deadlineMinutes !== null ? deadlineMinutes - 30 : null;
+
             user.tasks.push({
                 id: taskId,
                 title: taskTitle,
@@ -413,19 +469,33 @@ module.exports = async (req, res) => {
                 date: getTodayStr(),
                 dateKey: getTodayDate(),
                 time: getTimeStr(),
+                deadlineTime,
+                deadlineMinutes,
+                reminderMinutes,
+                reminderSent: false,
+                deadlineSent: false,
                 completed: false
             });
             user.pendingTaskTitle = null;
+            user.pendingTaskPriority = null;
             user.state = null;
+
+            let confirmText = `✅ <b>Vazifa Qo'shildi!</b>\n\n📌 <b>${escapeHtml(taskTitle)}</b>\n${emoji} <b>Zarurlik:</b> ${label}\n${timeDisplay}`;
+            if (deadlineTime) {
+                confirmText += `\n⏰ <b>Eslatma:</b> ${deadlineTime} dan 30 daqiqa oldin xabar beraman!`;
+            }
 
             await sendTelegramApi('sendMessage', {
                 chat_id: chatId,
-                text: `✅ <b>Vazifa Qo'shildi!</b>\n\n📌 ${escapeHtml(taskTitle)}\n${emoji} <b>${label}</b> muhimlik\n🕐 ${getTimeStr()}`,
+                text: confirmText,
                 parse_mode: 'HTML',
                 reply_markup: MAIN_KEYBOARD
             });
             return res.status(200).send('OK');
         }
+
+        // ── REMINDER CHECK (har xabarda) ─────────────────────
+        await checkAndSendReminders(chatId, user);
 
         // Raqam yuborsа (state yo'q)
         const detected = parseAmount(text);
@@ -455,6 +525,56 @@ module.exports = async (req, res) => {
 
     return res.status(200).send('OK');
 };
+
+// ============================================================
+// REMINDER CHECKER — har xabarda tekshiriladi
+// ============================================================
+async function checkAndSendReminders(chatId, user) {
+    const now = new Date();
+    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    const today = getTodayDate();
+
+    for (const task of user.tasks) {
+        if (task.completed || !task.deadlineMinutes) continue;
+        if (task.dateKey !== today) continue;
+
+        // 30 daqiqa oldin eslatma
+        if (!task.reminderSent &&
+            task.reminderMinutes !== null &&
+            nowMinutes >= task.reminderMinutes &&
+            nowMinutes < task.deadlineMinutes) {
+            task.reminderSent = true;
+            const remaining = task.deadlineMinutes - nowMinutes;
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `⏰ <b>ESLATMA!</b>\n\n📌 <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label}\n\n⏱ <b>${remaining} daqiqadan keyin</b> (<code>${task.deadlineTime}</code>) muddat tugaydi!\n\nTez bajaring! 💪`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Bajarildi!', callback_data: `done_task_${task.id}` }
+                    ]]
+                }
+            });
+        }
+
+        // Muddat o'tganida ham eslatma
+        if (!task.deadlineSent && nowMinutes >= task.deadlineMinutes) {
+            task.deadlineSent = true;
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `🔔 <b>MUDDAT TUGADI!</b>\n\n📌 <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label}\n\n⏰ <code>${task.deadlineTime}</code> — muddat tugagan!\n\nVazifani bajardingizmi?`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Ha, bajardim!', callback_data: `done_task_${task.id}` },
+                        { text: '⏳ Hali yo\'q', callback_data: `skip_task_${task.id}` }
+                    ]]
+                }
+            });
+        }
+    }
+}
+
 
 // ============================================================
 // CALLBACK QUERY — Inline tugmalar (Bajarildi / O'chirish)
@@ -515,7 +635,32 @@ async function handleCallbackQuery(cq) {
         const firstName = cq.from ? cq.from.first_name : 'Foydalanuvchi';
         await sendStatistics(chatId, firstName, user, periodMap[data]);
     }
+
+    // Hali bajarilmadi tugmasi
+    if (data.startsWith('skip_task_')) {
+        const taskId = data.replace('skip_task_', '');
+        const task = user.tasks.find(t => t.id === taskId);
+        await sendTelegramApi('answerCallbackQuery', {
+            callback_query_id: cq.id,
+            text: "⏳ Yaxshi, keyinroq bajaring!",
+            show_alert: false
+        });
+        if (task) {
+            await sendTelegramApi('editMessageText', {
+                chat_id: chatId,
+                message_id: cq.message.message_id,
+                text: `⏳ <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label}\n\n<i>Hali bajarilmadi. Tez orada bajarishni unutmang!</i>`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Bajarildi!', callback_data: `done_task_${taskId}` }
+                    ]]
+                }
+            });
+        }
+    }
 }
+
 
 
 // ============================================================
