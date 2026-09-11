@@ -18,7 +18,10 @@ const SECRET_CODE = '0000';   // ← Yangi kod
 // ============================================================
 // IN-MEMORY STORE
 // ============================================================
-const userStore = {};
+// global.userStore orqali Vercel warm instance davomida saqlash
+if (!global.userStore) global.userStore = {};
+const userStore = global.userStore;
+
 
 function getUser(chatId) {
     if (!userStore[chatId]) {
@@ -227,6 +230,22 @@ module.exports = async (req, res) => {
         }
 
         // ── AUTH CHECK ────────────────────────────────────────
+        // Keyboard tugmalari (menyu bosishlari) — kod deb qabul qilinmasin
+        const KEYBOARD_TEXTS = [
+            '💸 Harajat Qo\'shish', '✅ Vazifa Qo\'shish',
+            '📊 Kunlik Hisobot', '📋 Vazifalar Ro\'yxati',
+            '📈 Statistika', '🌐 Web Sayt',
+            '🍽 Taom/Oziq-ovqat', '🚕 Transport', '🛍 Xarid',
+            '💊 Sog\'liq', '💡 Kommunal', '🎬 O\'yin-kulgi', '📦 Boshqa',
+            '🔴 Juda Zarur (Bugun hal qilinishi shart)',
+            '🟡 Muhim (Imkon topilsa bajarilsin)',
+            '🟢 Oddiy (Ertaga ham bo\'ladi)',
+            '⏰ 09:00', '⏰ 12:00', '⏰ 15:00',
+            '⏰ 18:00', '⏰ 20:00', '⏰ 22:00',
+            '📅 Muddatsiz (Eslatma yo\'q)',
+            '🔐 Kodni Kiritish'
+        ];
+
         if (!isAuthenticated(user)) {
             if (text === SECRET_CODE) {
                 user.authenticated = true;
@@ -234,11 +253,20 @@ module.exports = async (req, res) => {
                 user.wrongAttempts = 0;
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
-                    text: `✅ <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b> 🎉\n\n🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n📌 Bugun siz uchun:\n💸 Harajat qo'shing\n✅ Vazifa belgilang\n📊 Hisobot ko'ring\n\n<i>Bugun shu kod bilan bir marta kirasiz — qayta so'ralmaydi.</i>`,
+                    text: `✅ <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b> 🎉\n\n🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n📌 Bugun siz uchun:\n💸 Harajat qo'shing\n✅ Vazifa belgilang\n📊 Hisobot ko'ring\n\n<i>Bugun yana kod so'ralmaydi. 24 soatdan keyin 1 marta so'raladi.</i>`,
                     parse_mode: 'HTML',
                     reply_markup: MAIN_KEYBOARD
                 });
+            } else if (KEYBOARD_TEXTS.includes(text) || text.startsWith('/') || text.startsWith('⏰')) {
+                // Menyu tugmasi bosgan — kod so'ra, "xato" dema
+                await sendTelegramApi('sendMessage', {
+                    chat_id: chatId,
+                    text: `🔐 <b>Sessiya tugagan.</b>\n\nDavom etish uchun kodni kiriting:\n<code>0000</code>`,
+                    parse_mode: 'HTML',
+                    reply_markup: { remove_keyboard: true }
+                });
             } else if (text.length > 0) {
+                // Faqat haqiqiy noto'g'ri kod kiritilganda xato ko'rsat
                 user.wrongAttempts = (user.wrongAttempts || 0) + 1;
                 if (user.wrongAttempts >= 5) {
                     await sendTelegramApi('sendMessage', {
@@ -250,13 +278,14 @@ module.exports = async (req, res) => {
                 } else {
                     await sendTelegramApi('sendMessage', {
                         chat_id: chatId,
-                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>`,
+                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>\n\nTo'g'ri kodni kiriting:`,
                         parse_mode: 'HTML'
                     });
                 }
             }
             return res.status(200).send('OK');
         }
+
 
         // ── MAIN MENU BUTTONS ─────────────────────────────────
 
