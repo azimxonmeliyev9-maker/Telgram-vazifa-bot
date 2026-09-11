@@ -188,12 +188,55 @@ module.exports = async (req, res) => {
 
     const msg = update.message;
     const chatId = msg.chat.id;
-    const text = (msg.text || '').trim();
     const firstName = msg.from ? msg.from.first_name : 'Foydalanuvchi';
     const host = req.headers.host || 'telgram-vazifa-bot.vercel.app';
     const webAppUrl = `https://${host}`;
-
     const user = getUser(chatId);
+
+    // ================================================
+    // VOICE MESSAGE HANDLER (Galasovoy)
+    // ================================================
+    if (msg.voice || msg.audio) {
+        const authenticated = isAuthenticated(user);
+        if (!authenticated) {
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `🔐 Avval maxfiy kodni kiriting!`,
+                parse_mode: 'HTML'
+            });
+            return res.status(200).send('OK');
+        }
+        refreshActivity(user);
+
+        const fileId = msg.voice ? msg.voice.file_id : msg.audio.file_id;
+        const duration = msg.voice ? msg.voice.duration : 0;
+
+        // Get file path from Telegram
+        const fileInfoRaw = await sendTelegramApi('getFile', { file_id: fileId });
+        const fileInfo = JSON.parse(fileInfoRaw);
+
+        if (fileInfo.ok && fileInfo.result && fileInfo.result.file_path) {
+            // Voice qabul qilindi - summa va izoh so'raymiz
+            user.state = 'awaiting_expense_amount_after_voice';
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `🎤 <b>Ovozli xabar qabul qilindi!</b> (${duration} sek)\n\n❓ Harajat summasini yozing:\n<i>Masalan: 50000</i>`,
+                parse_mode: 'HTML',
+                reply_markup: { remove_keyboard: true }
+            });
+        } else {
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `🎤 Ovozli xabar qabul qilindi!\n\n❓ Harajat summasini yozing:`,
+                parse_mode: 'HTML',
+                reply_markup: { remove_keyboard: true }
+            });
+            user.state = 'awaiting_expense_amount_after_voice';
+        }
+        return res.status(200).send('OK');
+    }
+
+    const text = (msg.text || '').trim();
 
     try {
         // ================================================
@@ -317,7 +360,7 @@ module.exports = async (req, res) => {
         // ================================================
 
         // STATE: awaiting_expense_amount
-        if (user.state === 'awaiting_expense_amount') {
+        if (user.state === 'awaiting_expense_amount' || user.state === 'awaiting_expense_amount_after_voice') {
             const amount = parseAmount(text);
             if (amount) {
                 user.pendingAmount = amount;
