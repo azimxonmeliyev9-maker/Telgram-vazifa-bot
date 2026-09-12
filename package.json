@@ -1,0 +1,8 @@
+{
+  "name": "telegram-vazifa-bot",
+  "version": "1.0.0",
+  "description": "Personal Telegram Bot - Vazifa va Harajat Tracker",
+  "dependencies": {
+    "@vercel/kv": "^1.0.0"
+  }
+}

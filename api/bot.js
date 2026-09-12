@@ -1,49 +1,66 @@
 /**
- * VERCEL SERVERLESS FUNCTION - TELEGRAM BOT (24/7) v3.0
- * ✅ Yangiliklar:
- * 1. Kod faqat ertalab bir marta so'raladi (kunlik sessiya)
- * 2. Yangi kod: 0000
- * 3. Ovozli xabar → summa → toifa (to'liq flow)
- * 4. Vazifalar inline "Bajarildi" tugmasi bilan
- * 5. /stat - Statistika bo'limi
- * 6. Callback query handler
- * 7. Harajat izohida parol saqlanib qolish muammosi hal qilindi
+ * VERCEL SERVERLESS FUNCTION - TELEGRAM BOT (24/7) v4.0
+ * ✅ v4.0 Yangiliklar:
+ * 1. Vercel KV (persistent DB) — cold start muammosi hal qilindi
+ * 2. Kod faqat 24 soatda 1 marta so'raladi (hech qachon undan ko'p emas)
+ * 3. Auth, harajatlar, vazifalar — barchasi doimiy saqlanadi
  */
 
 const https = require('https');
 
 const BOT_TOKEN = '8699086796:AAEeqqySXI7fXkQmomMEskOWj_zeH9cnMDY';
-const SECRET_CODE = '0000';   // ← Yangi kod
+const SECRET_CODE = '0000';
 
 // ============================================================
-// IN-MEMORY STORE
+// VERCEL KV — PERSISTENT STORAGE
 // ============================================================
-// global.userStore orqali Vercel warm instance davomida saqlash
-if (!global.userStore) global.userStore = {};
-const userStore = global.userStore;
+let kv = null;
+try {
+    kv = require('@vercel/kv').kv;
+} catch(e) {
+    // KV ulangmagan bo'lsa, in-memory fallback
+    if (!global.userStore) global.userStore = {};
+}
 
-
-function getUser(chatId) {
-    if (!userStore[chatId]) {
-        userStore[chatId] = {
-            authenticated: false,
-            authDate: null,       // Bugungi sana (YYYY-MM-DD)
-            wrongAttempts: 0,
-            state: null,
-            pendingAmount: null,
-            pendingTaskTitle: null,
-            expenses: [],
-            tasks: []
-        };
+async function loadUser(chatId) {
+    const defaultUser = {
+        authenticated: false,
+        authDate: null,
+        wrongAttempts: 0,
+        state: null,
+        pendingAmount: null,
+        pendingTaskTitle: null,
+        pendingTaskPriority: null,
+        expenses: [],
+        tasks: []
+    };
+    if (kv) {
+        try {
+            const data = await kv.get(`user:${chatId}`);
+            if (data) return Object.assign({}, defaultUser, typeof data === 'string' ? JSON.parse(data) : data);
+        } catch(e) {}
+    } else {
+        if (!global.userStore[chatId]) global.userStore[chatId] = defaultUser;
+        return global.userStore[chatId];
     }
-    return userStore[chatId];
+    return defaultUser;
+}
+
+async function saveUser(chatId, user) {
+    if (kv) {
+        try {
+            await kv.set(`user:${chatId}`, user);
+        } catch(e) {}
+    } else {
+        global.userStore[chatId] = user;
+    }
 }
 
 function getTodayDate() {
     return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 }
 
-// Faqat yangi kun boshida qayta so'raladi
+// 24 soatda bir marta — authDate bugungi sana bo'lsa authenticated
 function isAuthenticated(user) {
     if (!user.authenticated) return false;
     const today = getTodayDate();
@@ -54,6 +71,8 @@ function isAuthenticated(user) {
     }
     return true;
 }
+
+
 
 // ============================================================
 // TELEGRAM API
@@ -166,7 +185,7 @@ async function sendAuthPrompt(chatId, isNewDay = false) {
 // ============================================================
 module.exports = async (req, res) => {
     if (req.method !== 'POST') {
-        return res.status(200).send('Telegram Bot v3.0 (24/7) Active!');
+        return res.status(200).send('Telegram Bot v4.0 (24/7) Active!');
     }
 
     let update = req.body;
@@ -187,7 +206,12 @@ module.exports = async (req, res) => {
     const firstName = msg.from ? msg.from.first_name : 'Foydalanuvchi';
     const host = req.headers.host || 'telgram-vazifa-bot.vercel.app';
     const webAppUrl = `https://${host}`;
-    const user = getUser(chatId);
+
+    // KV dan user ma'lumotlarini yuklash
+    const user = await loadUser(chatId);
+
+    // Helper: state o'zgarishini saqlash
+    async function save() { await saveUser(chatId, user); }
 
     try {
         // ── VOICE / AUDIO MESSAGE ─────────────────────────────
@@ -198,6 +222,7 @@ module.exports = async (req, res) => {
             }
             const duration = msg.voice ? msg.voice.duration : 0;
             user.state = 'awaiting_expense_amount_after_voice';
+            await save();
             await sendTelegramApi('sendMessage', {
                 chat_id: chatId,
                 text: `🎤 <b>Ovozli xabar qabul qilindi!</b> (${duration} sek)\n\n💰 Harajat summasini yozing:\n<i>Masalan: 50000</i>`,
@@ -251,23 +276,24 @@ module.exports = async (req, res) => {
                 user.authenticated = true;
                 user.authDate = getTodayDate();
                 user.wrongAttempts = 0;
+                await save();  // ← KV ga saqlash
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
-                    text: `✅ <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b> 🎉\n\n🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n📌 Bugun siz uchun:\n💸 Harajat qo'shing\n✅ Vazifa belgilang\n📊 Hisobot ko'ring\n\n<i>Bugun yana kod so'ralmaydi. 24 soatdan keyin 1 marta so'raladi.</i>`,
+                    text: `✅ <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b> 🎉\n\n🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n📌 Bugun siz uchun:\n💸 Harajat qo'shing\n✅ Vazifa belgilang\n📊 Hisobot ko'ring\n\n<i>✅ Bugun yana kod so'ralmaydi. Faqat ertaga 1 marta so'raladi.</i>`,
                     parse_mode: 'HTML',
                     reply_markup: MAIN_KEYBOARD
                 });
             } else if (KEYBOARD_TEXTS.includes(text) || text.startsWith('/') || text.startsWith('⏰')) {
-                // Menyu tugmasi bosgan — kod so'ra, "xato" dema
+                // Menyu tugmasi bosgan — "Sessiya tugagan" xabar
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
-                    text: `🔐 <b>Sessiya tugagan.</b>\n\nDavom etish uchun kodni kiriting:\n<code>0000</code>`,
+                    text: `🔐 <b>Kunlik tasdiqlash kerak.</b>\n\nHar 24 soatda bir marta kodni kiriting:\n<code>0000</code>`,
                     parse_mode: 'HTML',
                     reply_markup: { remove_keyboard: true }
                 });
             } else if (text.length > 0) {
-                // Faqat haqiqiy noto'g'ri kod kiritilganda xato ko'rsat
                 user.wrongAttempts = (user.wrongAttempts || 0) + 1;
+                await save();
                 if (user.wrongAttempts >= 5) {
                     await sendTelegramApi('sendMessage', {
                         chat_id: chatId,
@@ -275,10 +301,11 @@ module.exports = async (req, res) => {
                         parse_mode: 'HTML'
                     });
                     user.wrongAttempts = 0;
+                    await save();
                 } else {
                     await sendTelegramApi('sendMessage', {
                         chat_id: chatId,
-                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>\n\nTo'g'ri kodni kiriting:`,
+                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>\n\nKodni kiriting: <code>0000</code>`,
                         parse_mode: 'HTML'
                     });
                 }
@@ -369,6 +396,7 @@ module.exports = async (req, res) => {
             if (amount) {
                 user.pendingAmount = amount;
                 user.state = 'awaiting_expense_desc';
+                await save();
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
                     text: `💰 Summa: <b>${formatMoney(amount)}</b>\n\n❓ <b>Nima uchun sarflandi?</b>\nToifa tanlang yoki o'zingiz yozing:`,
@@ -385,6 +413,7 @@ module.exports = async (req, res) => {
             return res.status(200).send('OK');
         }
 
+
         // Izoh / toifa kiritish
         if (user.state === 'awaiting_expense_desc') {
             const amount = user.pendingAmount;
@@ -399,6 +428,7 @@ module.exports = async (req, res) => {
                 });
                 user.pendingAmount = null;
                 user.state = null;
+                await save();  // ← harajat KV ga saqlandi
 
                 const todayTotal = user.expenses
                     .filter(e => e.dateKey === getTodayDate())
