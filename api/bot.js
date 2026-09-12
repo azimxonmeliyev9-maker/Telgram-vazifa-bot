@@ -139,12 +139,12 @@ const MAIN_KEYBOARD = {
     keyboard: [
         [{ text: '💸 Harajat Qo\'shish' }, { text: '✅ Vazifa Qo\'shish' }],
         [{ text: '📊 Kunlik Hisobot' },   { text: '📋 Vazifalar Ro\'yxati' }],
-        [{ text: '💰 Balans' },            { text: '📈 Statistika' }],
-        [{ text: '🌐 Web Sayt' }]
+        [{ text: '💰 Balans' },            { text: '📈 Statistika' }]
     ],
     resize_keyboard: true,
     persistent: true
 };
+
 
 
 const CATEGORY_KEYBOARD = {
