@@ -170,8 +170,8 @@ const PRIORITY_KEYBOARD = {
 // ============================================================
 async function sendAuthPrompt(chatId, isNewDay = false) {
     const text = isNewDay
-        ? `🌅 <b>Yangi kun boshlandi!</b>\n\nHar kuni bir marta tasdiqlash kerak.\n🔐 Bugungi kodni kiriting:`
-        : `🔐 <b>Salom!</b>\n\nBu bot shaxsiy himoyalangan.\nFoydalanish uchun <b>kodni</b> kiriting:`;
+        ? `🌅 <b>Yangi kun boshlandi!</b>\n\nKodingizni kiriting:`
+        : `🔐 <b>Salom!</b>\n\nBu bot shaxsiy himoyalangan.\nKodingizni kiriting:`;
     await sendTelegramApi('sendMessage', {
         chat_id: chatId,
         text,
@@ -179,6 +179,7 @@ async function sendAuthPrompt(chatId, isNewDay = false) {
         reply_markup: { remove_keyboard: true }
     });
 }
+
 
 // ============================================================
 // MAIN WEBHOOK HANDLER
@@ -276,7 +277,7 @@ module.exports = async (req, res) => {
                 user.authenticated = true;
                 user.authDate = getTodayDate();
                 user.wrongAttempts = 0;
-                await save();  // ← KV ga saqlash
+                await save();
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
                     text: `✅ <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b> 🎉\n\n🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n📌 Bugun siz uchun:\n💸 Harajat qo'shing\n✅ Vazifa belgilang\n📊 Hisobot ko'ring\n\n<i>✅ Bugun yana kod so'ralmaydi. Faqat ertaga 1 marta so'raladi.</i>`,
@@ -284,10 +285,9 @@ module.exports = async (req, res) => {
                     reply_markup: MAIN_KEYBOARD
                 });
             } else if (KEYBOARD_TEXTS.includes(text) || text.startsWith('/') || text.startsWith('⏰')) {
-                // Menyu tugmasi bosgan — "Sessiya tugagan" xabar
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
-                    text: `🔐 <b>Kunlik tasdiqlash kerak.</b>\n\nHar 24 soatda bir marta kodni kiriting:\n<code>0000</code>`,
+                    text: `🔐 <b>Kunlik tasdiqlash kerak.</b>\n\nKodingizni kiriting:`,
                     parse_mode: 'HTML',
                     reply_markup: { remove_keyboard: true }
                 });
@@ -305,7 +305,7 @@ module.exports = async (req, res) => {
                 } else {
                     await sendTelegramApi('sendMessage', {
                         chat_id: chatId,
-                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>\n\nKodni kiriting: <code>0000</code>`,
+                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>`,
                         parse_mode: 'HTML'
                     });
                 }
