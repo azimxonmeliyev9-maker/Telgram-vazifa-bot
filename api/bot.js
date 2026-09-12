@@ -388,7 +388,31 @@ module.exports = async (req, res) => {
         return;
     }
 
+    // ── Yangi foydalanuvchi botni boshladi (START tugmasi) ────
+    if (upd.my_chat_member) {
+        const mc = upd.my_chat_member;
+        if (mc.new_chat_member?.status === 'member') {
+            const chatId = mc.chat.id;
+            const name = mc.from?.first_name || 'Foydalanuvchi';
+            const u = await getUser(chatId);
+            if (!isAuth(u)) {
+                await send(chatId,
+                    `👋 <b>Assalomu alaykum, ${esc(name)}!</b>\n\n` +
+                    `🌟 <b>Xarajat & Vazifa Boti</b>\n\n` +
+                    `Bu bot yordamida:\n` +
+                    `  💸 Harajatlaringizni kuzating\n` +
+                    `  ✅ Vazifalar belgilang\n` +
+                    `  💰 Balansingizni nazorat qiling\n\n` +
+                    `🔐 Botdan foydalanish uchun kodni kiriting:`,
+                    { reply_markup: { remove_keyboard: true } }
+                );
+            }
+        }
+        return;
+    }
+
     if (!upd.message) return;
+
 
     const msg      = upd.message;
     const chatId   = msg.chat.id;
@@ -415,14 +439,26 @@ module.exports = async (req, res) => {
 
         // ── /start ────────────────────────────────────────────
         if (text === '/start' || text === '/menu') {
+            u.state = null; u.pending = {};
+            await save();
             if (isAuth(u)) {
                 await send(chatId,
-                    `👋 <b>Xush kelibsiz, ${esc(name)}!</b>\n\nQuyidagi tugmalardan foydalaning:`,
+                    `👋 <b>Xush kelibsiz, ${esc(name)}!</b>\n\n` +
+                    `💸 Harajat qo'shing\n` +
+                    `✅ Vazifa belgilang\n` +
+                    `💰 Balans ko'ring`,
                     { reply_markup: KB_MAIN }
                 );
             } else {
-                const newDay = u.authDate && u.authDate !== today();
-                await askCode(chatId, newDay);
+                await send(chatId,
+                    `👋 <b>Assalomu alaykum, ${esc(name)}!</b>\n\n` +
+                    `🌟 <b>Xarajat & Vazifa Boti</b>\n\n` +
+                    `  💸 Harajatlarni kuzating\n` +
+                    `  ✅ Vazifalar belgilang\n` +
+                    `  💰 Balansni nazorat qiling\n\n` +
+                    `🔐 Botdan foydalanish uchun kodni kiriting:`,
+                    { reply_markup: { remove_keyboard: true } }
+                );
             }
             return;
         }
