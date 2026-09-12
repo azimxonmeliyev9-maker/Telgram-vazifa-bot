@@ -32,7 +32,8 @@ async function loadUser(chatId) {
         pendingTaskTitle: null,
         pendingTaskPriority: null,
         expenses: [],
-        tasks: []
+        tasks: [],
+        incomes: []        // ← kirimlar (balans to'ldirish)
     };
     if (kv) {
         try {
@@ -138,11 +139,13 @@ const MAIN_KEYBOARD = {
     keyboard: [
         [{ text: '💸 Harajat Qo\'shish' }, { text: '✅ Vazifa Qo\'shish' }],
         [{ text: '📊 Kunlik Hisobot' },   { text: '📋 Vazifalar Ro\'yxati' }],
-        [{ text: '📈 Statistika' },        { text: '🌐 Web Sayt' }]
+        [{ text: '💰 Balans' },            { text: '📈 Statistika' }],
+        [{ text: '🌐 Web Sayt' }]
     ],
     resize_keyboard: true,
     persistent: true
 };
+
 
 const CATEGORY_KEYBOARD = {
     keyboard: [
@@ -260,7 +263,8 @@ module.exports = async (req, res) => {
         const KEYBOARD_TEXTS = [
             '💸 Harajat Qo\'shish', '✅ Vazifa Qo\'shish',
             '📊 Kunlik Hisobot', '📋 Vazifalar Ro\'yxati',
-            '📈 Statistika', '🌐 Web Sayt',
+            '💰 Balans', '📈 Statistika', '🌐 Web Sayt',
+            '💵 Kirim Qo\'shish', '📊 Balans Ko\'rish',
             '🍽 Taom/Oziq-ovqat', '🚕 Transport', '🛍 Xarid',
             '💊 Sog\'liq', '💡 Kommunal', '🎬 O\'yin-kulgi', '📦 Boshqa',
             '🔴 Juda Zarur (Bugun hal qilinishi shart)',
@@ -271,6 +275,7 @@ module.exports = async (req, res) => {
             '📅 Muddatsiz (Eslatma yo\'q)',
             '🔐 Kodni Kiritish'
         ];
+
 
         if (!isAuthenticated(user)) {
             if (text === SECRET_CODE) {
@@ -373,6 +378,24 @@ module.exports = async (req, res) => {
             return res.status(200).send('OK');
         }
 
+        if (text === '💰 Balans' || text === '/balans') {
+            user.state = null;
+            await sendBalanceSummary(chatId, firstName, user);
+            return res.status(200).send('OK');
+        }
+
+        if (text === '💵 Kirim Qo\'shish') {
+            user.state = 'awaiting_income_amount';
+            await sendTelegramApi('sendMessage', {
+                chat_id: chatId,
+                text: `💵 <b>Kirim Qo'shish</b>\n\nNecha so'm qo'shmoqchisiz?\n<i>Masalan: 2 500 000</i>`,
+                parse_mode: 'HTML',
+                reply_markup: { remove_keyboard: true }
+            });
+            return res.status(200).send('OK');
+        }
+
+
         if (text === '🌐 Web Sayt') {
             await sendTelegramApi('sendMessage', {
                 chat_id: chatId,
@@ -418,6 +441,7 @@ module.exports = async (req, res) => {
         if (user.state === 'awaiting_expense_desc') {
             const amount = user.pendingAmount;
             if (amount && text) {
+                if (!user.incomes) user.incomes = [];
                 user.expenses.push({
                     id: Date.now().toString(),
                     amount,
@@ -428,21 +452,98 @@ module.exports = async (req, res) => {
                 });
                 user.pendingAmount = null;
                 user.state = null;
-                await save();  // ← harajat KV ga saqlandi
+                await save();
 
                 const todayTotal = user.expenses
                     .filter(e => e.dateKey === getTodayDate())
                     .reduce((s, e) => s + e.amount, 0);
 
+                // Balans hisoblash
+                const totalIncome = user.incomes.reduce((s, i) => s + i.amount, 0);
+                const totalExpense = user.expenses.reduce((s, e) => s + e.amount, 0);
+                const remaining = totalIncome - totalExpense;
+
+                let balanceStr = '';
+                if (totalIncome > 0) {
+                    const remainingLine = remaining >= 0
+                        ? `✅ Qolgan balans: <b>${formatMoney(remaining)}</b>`
+                        : `⚠️ Balans: <b>-${formatMoney(Math.abs(remaining))}</b> (ortiqcha sarflandi!)`;
+                    balanceStr = `\n\n━━━━━━━━━━━━━━━━\n${remainingLine}`;
+                }
+
                 await sendTelegramApi('sendMessage', {
                     chat_id: chatId,
-                    text: `✅ <b>Harajat Saqlandi!</b>\n\n💵 <b>Summa:</b> ${formatMoney(amount)}\n📝 <b>Izoh:</b> ${escapeHtml(text)}\n🕐 <b>Vaqt:</b> ${getTimeStr()}\n\n📊 <b>Bugungi jami:</b> <code>${formatMoney(todayTotal)}</code>`,
+                    text: `✅ <b>Harajat Saqlandi!</b>\n\n💵 <b>Summa:</b> ${formatMoney(amount)}\n📝 <b>Izoh:</b> ${escapeHtml(text)}\n🕐 <b>Vaqt:</b> ${getTimeStr()}\n\n📊 <b>Bugungi jami harajat:</b> <code>${formatMoney(todayTotal)}</code>${balanceStr}`,
                     parse_mode: 'HTML',
                     reply_markup: MAIN_KEYBOARD
                 });
             }
             return res.status(200).send('OK');
         }
+
+        // Kirim miqdori (balans to'ldirish)
+        if (user.state === 'awaiting_income_amount') {
+            const amount = parseAmount(text);
+            if (amount) {
+                if (!user.incomes) user.incomes = [];
+                user.pendingIncomeAmount = amount;
+                user.state = 'awaiting_income_desc';
+                await save();
+                await sendTelegramApi('sendMessage', {
+                    chat_id: chatId,
+                    text: `💵 Miqdor: <b>${formatMoney(amount)}</b>\n\n📝 Bu kirimni izohlab bering:\n<i>Masalan: Oylik maosh, Bonus, Savdo daromadi</i>`,
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        keyboard: [
+                            ['💼 Oylik maosh', '🎁 Bonus'],
+                            ['🛒 Savdo daromadi', '📦 Boshqa kirim']
+                        ],
+                        resize_keyboard: true,
+                        one_time_keyboard: true
+                    }
+                });
+            } else {
+                await sendTelegramApi('sendMessage', {
+                    chat_id: chatId,
+                    text: `❗ Faqat <b>raqam</b> kiriting.\n<i>Masalan: 2500000</i>`,
+                    parse_mode: 'HTML'
+                });
+            }
+            return res.status(200).send('OK');
+        }
+
+        // Kirim izohi
+        if (user.state === 'awaiting_income_desc') {
+            const amount = user.pendingIncomeAmount;
+            if (amount && text) {
+                if (!user.incomes) user.incomes = [];
+                user.incomes.push({
+                    id: Date.now().toString(),
+                    amount,
+                    description: text,
+                    date: getTodayStr(),
+                    dateKey: getTodayDate(),
+                    time: getTimeStr()
+                });
+                user.pendingIncomeAmount = null;
+                user.state = null;
+                await save();
+
+                const totalIncome = user.incomes.reduce((s, i) => s + i.amount, 0);
+                const totalExpense = user.expenses.reduce((s, e) => s + e.amount, 0);
+                const remaining = totalIncome - totalExpense;
+
+                await sendTelegramApi('sendMessage', {
+                    chat_id: chatId,
+                    text: `✅ <b>Kirim Saqlandi!</b>\n\n💵 <b>Summa:</b> ${formatMoney(amount)}\n📝 <b>Izoh:</b> ${escapeHtml(text)}\n\n━━━━━━━━━━━━━━━━\n📥 <b>Jami kirim:</b> ${formatMoney(totalIncome)}\n📤 <b>Jami harajat:</b> ${formatMoney(totalExpense)}\n✅ <b>Qolgan balans:</b> <code>${formatMoney(remaining)}</code>`,
+                    parse_mode: 'HTML',
+                    reply_markup: MAIN_KEYBOARD
+                });
+            }
+            return res.status(200).send('OK');
+        }
+
+
 
         // Vazifa sarlavhasi
         if (user.state === 'awaiting_task_title') {
@@ -636,12 +737,76 @@ async function checkAndSendReminders(chatId, user) {
 
 
 // ============================================================
+// ============================================================
+// BALANCE SUMMARY
+// ============================================================
+async function sendBalanceSummary(chatId, firstName, user) {
+    if (!user.incomes) user.incomes = [];
+    const totalIncome = user.incomes.reduce((s, i) => s + i.amount, 0);
+    const totalExpense = user.expenses.reduce((s, e) => s + e.amount, 0);
+    const remaining = totalIncome - totalExpense;
+
+    if (totalIncome === 0) {
+        await sendTelegramApi('sendMessage', {
+            chat_id: chatId,
+            text: `💰 <b>Balansingiz</b>\n\n<i>Hali kirim qo'shilmagan.</i>\n\nBirinchi kirimingizni qo'shing:`,
+            parse_mode: 'HTML',
+            reply_markup: {
+                keyboard: [
+                    ['💵 Kirim Qo\'shish'],
+                    ['🔙 Orqaga']
+                ],
+                resize_keyboard: true
+            }
+        });
+        return;
+    }
+
+    // Oylik foiz
+    const now = new Date();
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    const monthIncome = user.incomes.filter(i => i.dateKey && i.dateKey.startsWith(monthKey)).reduce((s,i)=>s+i.amount,0);
+    const monthExpense = user.expenses.filter(e => e.dateKey && e.dateKey.startsWith(monthKey)).reduce((s,e)=>s+e.amount,0);
+
+    const percentSpent = totalIncome > 0 ? Math.round((totalExpense / totalIncome) * 100) : 0;
+    const monthPercentSpent = monthIncome > 0 ? Math.round((monthExpense / monthIncome) * 100) : 0;
+
+    const remainingEmoji = remaining >= 0 ? '✅' : '⚠️';
+    const remainingText = remaining >= 0
+        ? `${formatMoney(remaining)}`
+        : `-${formatMoney(Math.abs(remaining))} ⚠️`;
+
+    // So'nggi 3 kirim
+    const lastIncomes = user.incomes.slice(-3).reverse();
+    let incomesText = '';
+    lastIncomes.forEach(i => {
+        incomesText += `\n  • ${escapeHtml(i.description)} — <b>${formatMoney(i.amount)}</b> <i>(${i.date})</i>`;
+    });
+
+    await sendTelegramApi('sendMessage', {
+        chat_id: chatId,
+        text: `💰 <b>Balansingiz</b>\n👤 <b>${escapeHtml(firstName)}</b>\n\n📥 <b>Jami kirim:</b> <code>${formatMoney(totalIncome)}</code>\n📤 <b>Jami harajat:</b> <code>${formatMoney(totalExpense)}</code>\n━━━━━━━━━━━━━━━━\n${remainingEmoji} <b>Qolgan:</b> <code>${remainingText}</code>\n\n📊 <b>Bu oy:</b> -${formatMoney(monthExpense)} (${monthPercentSpent}%)\n📈 <b>Jami sarflangan:</b> ${percentSpent}%\n\n💵 <b>So'nggi kirimlar:</b>${incomesText || '\n  <i>Yo\'q</i>'}`,
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '➕ Kirim Qo\'shish', callback_data: 'add_income' },
+                    { text: '🔄 Yangilash', callback_data: 'refresh_balance' }
+                ]
+            ]
+        }
+    });
+}
+
+// ============================================================
 // CALLBACK QUERY — Inline tugmalar (Bajarildi / O'chirish)
 // ============================================================
 async function handleCallbackQuery(cq) {
     const chatId = cq.message.chat.id;
     const data = cq.data || '';
-    const user = getUser(chatId);
+    const user = await loadUser(chatId);
+    async function save() { await saveUser(chatId, user); }
+
 
     if (data.startsWith('done_task_')) {
         const taskId = data.replace('done_task_', '');
@@ -718,7 +883,35 @@ async function handleCallbackQuery(cq) {
             });
         }
     }
+
+    // Balans callback tugmalari
+    if (data === 'add_income') {
+        await sendTelegramApi('answerCallbackQuery', {
+            callback_query_id: cq.id,
+            text: 'Kirim qo\'shish...',
+            show_alert: false
+        });
+        user.state = 'awaiting_income_amount';
+        await save();
+        await sendTelegramApi('sendMessage', {
+            chat_id: chatId,
+            text: `💵 <b>Kirim Qo'shish</b>\n\nNecha so'm qo'shmoqchisiz?\n<i>Masalan: 2 500 000</i>`,
+            parse_mode: 'HTML',
+            reply_markup: { remove_keyboard: true }
+        });
+    }
+
+    if (data === 'refresh_balance') {
+        const firstName = cq.from ? cq.from.first_name : 'Foydalanuvchi';
+        await sendTelegramApi('answerCallbackQuery', {
+            callback_query_id: cq.id,
+            text: '🔄 Yangilanmoqda...',
+            show_alert: false
+        });
+        await sendBalanceSummary(chatId, firstName, user);
+    }
 }
+
 
 
 
