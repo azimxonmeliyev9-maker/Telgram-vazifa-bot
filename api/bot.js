@@ -1,1091 +1,783 @@
 /**
- * VERCEL SERVERLESS FUNCTION - TELEGRAM BOT (24/7) v4.0
- * ✅ v4.0 Yangiliklar:
- * 1. Vercel KV (persistent DB) — cold start muammosi hal qilindi
- * 2. Kod faqat 24 soatda 1 marta so'raladi (hech qachon undan ko'p emas)
- * 3. Auth, harajatlar, vazifalar — barchasi doimiy saqlanadi
+ * ╔═══════════════════════════════════════════════════════╗
+ * ║   XARAJAT & VAZIFA BOT  —  v5.0 Professional         ║
+ * ║   Azimjon uchun shaxsiy moliyaviy boshqaruv boti      ║
+ * ╚═══════════════════════════════════════════════════════╝
+ *
+ *  ✅ v5.0 Yangiliklar:
+ *   • Serverless-safe auth: har request KV dan yuklanadi
+ *   • Raqam yozilganda "Kod noto'g'ri" CHIQMAYDI
+ *   • Balans tizimi: kirim → harajat → qoldiq
+ *   • Vazifa: sarlavha → muhimlik → soat → eslatma
+ *   • Statistika: bugungi / haftalik / oylik / yillik
+ *   • Kunlik hisobot: har kuni soat 20:00 da avtomatik
  */
 
+'use strict';
 const https = require('https');
 
-const BOT_TOKEN = '8699086796:AAEeqqySXI7fXkQmomMEskOWj_zeH9cnMDY';
+// ─── CONSTANTS ───────────────────────────────────────────────
+const BOT_TOKEN   = '8699086796:AAEeqqySXI7fXkQmomMEskOWj_zeH9cnMDY';
 const SECRET_CODE = '0000';
 
-// ============================================================
-// VERCEL KV — PERSISTENT STORAGE
-// ============================================================
-let kv = null;
-try {
-    kv = require('@vercel/kv').kv;
-} catch(e) {
-    // KV ulangmagan bo'lsa, in-memory fallback
-    if (!global.userStore) global.userStore = {};
+// ─── PERSISTENT STORE (Vercel KV → global fallback) ──────────
+let _kv = null;
+try { _kv = require('@vercel/kv').kv; } catch (_) {}
+if (!global.__store) global.__store = {};
+
+async function dbGet(key) {
+    if (_kv) { try { return await _kv.get(key); } catch (_) {} }
+    return global.__store[key] ?? null;
+}
+async function dbSet(key, val) {
+    if (_kv) { try { await _kv.set(key, val); return; } catch (_) {} }
+    global.__store[key] = val;
 }
 
-async function loadUser(chatId) {
-    const defaultUser = {
-        authenticated: false,
-        authDate: null,
-        wrongAttempts: 0,
-        state: null,
-        pendingAmount: null,
-        pendingTaskTitle: null,
-        pendingTaskPriority: null,
-        expenses: [],
-        tasks: [],
-        incomes: []        // ← kirimlar (balans to'ldirish)
-    };
-    if (kv) {
-        try {
-            const data = await kv.get(`user:${chatId}`);
-            if (data) return Object.assign({}, defaultUser, typeof data === 'string' ? JSON.parse(data) : data);
-        } catch(e) {}
-    } else {
-        if (!global.userStore[chatId]) global.userStore[chatId] = defaultUser;
-        return global.userStore[chatId];
-    }
-    return defaultUser;
+// ─── USER MODEL ───────────────────────────────────────────────
+const DEFAULT_USER = () => ({
+    authDate     : null,   // 'YYYY-MM-DD' — bugun auth qilingan sana
+    wrongAttempts: 0,
+    state        : null,   // joriy dialog holati
+    pending      : {},     // vaqtinchalik ma'lumotlar
+    expenses     : [],
+    incomes      : [],
+    tasks        : []
+});
+
+async function getUser(chatId) {
+    const raw = await dbGet(`u:${chatId}`);
+    if (!raw) return DEFAULT_USER();
+    const d = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return Object.assign(DEFAULT_USER(), d);
+}
+async function putUser(chatId, u) {
+    await dbSet(`u:${chatId}`, u);
 }
 
-async function saveUser(chatId, user) {
-    if (kv) {
-        try {
-            await kv.set(`user:${chatId}`, user);
-        } catch(e) {}
-    } else {
-        global.userStore[chatId] = user;
-    }
-}
+// ─── AUTH ─────────────────────────────────────────────────────
+function today() { return new Date().toISOString().slice(0, 10); }
 
-function getTodayDate() {
-    return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-}
+function isAuth(u) { return u.authDate === today(); }
 
-// 24 soatda bir marta — authDate bugungi sana bo'lsa authenticated
-function isAuthenticated(user) {
-    if (!user.authenticated) return false;
-    const today = getTodayDate();
-    if (user.authDate !== today) {
-        user.authenticated = false;
-        user.state = null;
-        return false;
-    }
-    return true;
-}
-
-
-
-// ============================================================
-// TELEGRAM API
-// ============================================================
-function sendTelegramApi(method, data) {
-    return new Promise((resolve, reject) => {
-        const payload = JSON.stringify(data);
-        const options = {
-            hostname: 'api.telegram.org',
-            path: `/bot${BOT_TOKEN}/${method}`,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload)
-            }
-        };
-        const req = https.request(options, (res) => {
-            let body = '';
-            res.on('data', c => body += c);
-            res.on('end', () => resolve(body));
-        });
-        req.on('error', reject);
-        req.write(payload);
-        req.end();
-    });
-}
-
-// ============================================================
-// HELPERS
-// ============================================================
-function parseAmount(text) {
-    if (!text) return null;
-    const clean = text.replace(/\s+/g,'').replace(/,/g,'')
-        .replace(/uzs/gi,'').replace(/so'm/gi,'').replace(/som/gi,'');
-    if (/^\d+(\.\d+)?$/.test(clean)) {
-        const n = parseFloat(clean);
-        return n > 0 ? n : null;
-    }
-    return null;
-}
-
-function formatMoney(amount) {
-    return new Intl.NumberFormat('uz-UZ').format(amount) + ' UZS';
-}
-
-function getTodayStr() {
+// ─── HELPERS ──────────────────────────────────────────────────
+function money(n) { return new Intl.NumberFormat('uz-UZ').format(n) + ' UZS'; }
+function dateStr() {
     return new Date().toLocaleDateString('uz-UZ', { year:'numeric', month:'long', day:'numeric' });
 }
-
-function getTimeStr() {
+function timeStr() {
     return new Date().toLocaleTimeString('uz-UZ', { hour:'2-digit', minute:'2-digit' });
 }
-
-function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+function parseNum(s) {
+    if (!s) return null;
+    const n = parseFloat(String(s).replace(/[\s,_]/g, '').replace(/\s/g, ''));
+    return isFinite(n) && n > 0 ? n : null;
+}
+function isNumeric(s) { return /^\d[\d\s,._]*$/.test(s.trim()); }
 
-// ============================================================
-// KEYBOARDS
-// ============================================================
-const MAIN_KEYBOARD = {
+// ─── TELEGRAM API ─────────────────────────────────────────────
+function tgReq(method, body) {
+    return new Promise((ok, fail) => {
+        const payload = JSON.stringify(body);
+        const req = https.request({
+            hostname: 'api.telegram.org',
+            path    : `/bot${BOT_TOKEN}/${method}`,
+            method  : 'POST',
+            headers : { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+        }, res => {
+            let d = ''; res.on('data', c => d += c);
+            res.on('end', () => ok(JSON.parse(d)));
+        });
+        req.on('error', fail);
+        req.write(payload); req.end();
+    });
+}
+const send = (chatId, text, extra = {}) =>
+    tgReq('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra });
+
+// ─── KEYBOARDS ────────────────────────────────────────────────
+const KB_MAIN = {
     keyboard: [
-        [{ text: '💸 Harajat Qo\'shish' }, { text: '✅ Vazifa Qo\'shish' }],
-        [{ text: '📊 Kunlik Hisobot' },   { text: '📋 Vazifalar Ro\'yxati' }],
-        [{ text: '💰 Balans' },            { text: '📈 Statistika' }]
+        ['💸 Harajat Qo\'shish', '✅ Vazifa Qo\'shish'],
+        ['📊 Kunlik Hisobot',    '📋 Vazifalar Ro\'yxati'],
+        ['💰 Balans',            '📈 Statistika']
     ],
     resize_keyboard: true,
     persistent: true
 };
+const KB_REMOVE = { remove_keyboard: true };
 
-
-
-const CATEGORY_KEYBOARD = {
+const KB_CATEGORY = {
     keyboard: [
         ['🍽 Taom/Oziq-ovqat', '🚕 Transport'],
-        ['🛍 Xarid', '💊 Sog\'liq'],
-        ['💡 Kommunal', '🎬 O\'yin-kulgi'],
+        ['🛍 Xarid',            '💊 Sog\'liq'],
+        ['💡 Kommunal',         '🎬 O\'yin-kulgi'],
         ['📦 Boshqa']
     ],
-    resize_keyboard: true,
-    one_time_keyboard: true
+    resize_keyboard: true, one_time_keyboard: true
 };
-
-const PRIORITY_KEYBOARD = {
+const KB_PRIORITY = {
     keyboard: [
-        ['🔴 Yuqori (Shoshilinch)'],
-        ['🟡 O\'rta (Muhim)'],
-        ['🟢 Past (Odatiy)']
+        ['🔴 Juda Zarur'],
+        ['🟡 Muhim'],
+        ['🟢 Oddiy']
     ],
-    resize_keyboard: true,
-    one_time_keyboard: true
+    resize_keyboard: true, one_time_keyboard: true
+};
+const KB_TIME = {
+    keyboard: [
+        ['⏰ 09:00', '⏰ 12:00', '⏰ 15:00'],
+        ['⏰ 18:00', '⏰ 20:00', '⏰ 22:00'],
+        ['📅 Vaqtsiz (eslatma yo\'q)']
+    ],
+    resize_keyboard: true, one_time_keyboard: true
+};
+const KB_INCOME_CAT = {
+    keyboard: [
+        ['💼 Oylik maosh', '🎁 Bonus'],
+        ['🛒 Savdo daromadi', '📦 Boshqa kirim']
+    ],
+    resize_keyboard: true, one_time_keyboard: true
 };
 
-// ============================================================
-// SEND AUTH PROMPT
-// ============================================================
-async function sendAuthPrompt(chatId, isNewDay = false) {
-    const text = isNewDay
-        ? `🌅 <b>Yangi kun boshlandi!</b>\n\nKodingizni kiriting:`
-        : `🔐 <b>Salom!</b>\n\nBu bot shaxsiy himoyalangan.\nKodingizni kiriting:`;
-    await sendTelegramApi('sendMessage', {
-        chat_id: chatId,
-        text,
-        parse_mode: 'HTML',
-        reply_markup: { remove_keyboard: true }
+// Barcha tugma textlari (auth bypass uchun)
+const MENU_TEXTS = new Set([
+    '💸 Harajat Qo\'shish','✅ Vazifa Qo\'shish',
+    '📊 Kunlik Hisobot','📋 Vazifalar Ro\'yxati',
+    '💰 Balans','📈 Statistika',
+    '🍽 Taom/Oziq-ovqat','🚕 Transport','🛍 Xarid',
+    '💊 Sog\'liq','💡 Kommunal','🎬 O\'yin-kulgi','📦 Boshqa',
+    '🔴 Juda Zarur','🟡 Muhim','🟢 Oddiy',
+    '⏰ 09:00','⏰ 12:00','⏰ 15:00',
+    '⏰ 18:00','⏰ 20:00','⏰ 22:00',
+    '📅 Vaqtsiz (eslatma yo\'q)',
+    '💼 Oylik maosh','🎁 Bonus','🛒 Savdo daromadi','📦 Boshqa kirim',
+    '💵 Kirim Qo\'shish'
+]);
+
+// ─── AUTH PROMPT ──────────────────────────────────────────────
+async function askCode(chatId, isNewDay = false) {
+    const txt = isNewDay
+        ? `🌅 <b>Yangi kun boshlandi!</b>\n\n🔐 Kunlik kodni kiriting:`
+        : `🔐 <b>Salom!</b>\n\nBu bot himoyalangan.\nKodingizni kiriting:`;
+    await send(chatId, txt, { reply_markup: KB_REMOVE });
+}
+
+// ─── BALANCE SUMMARY ─────────────────────────────────────────
+async function showBalance(chatId, name, u) {
+    const inc = (u.incomes || []).reduce((s, i) => s + i.amount, 0);
+    const exp = (u.expenses || []).reduce((s, e) => s + e.amount, 0);
+    const rem = inc - exp;
+
+    if (inc === 0) {
+        await send(chatId,
+            `💰 <b>Balansingiz</b>\n\n<i>Hali kirim qo'shilmagan.</i>\n\nDaromadingizni qo'shing:`,
+            {
+                reply_markup: {
+                    keyboard: [['💵 Kirim Qo\'shish']], resize_keyboard: true
+                }
+            }
+        );
+        return;
+    }
+
+    const now = new Date();
+    const mk = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    const mExp = (u.expenses||[]).filter(e => (e.dateKey||'').startsWith(mk)).reduce((s,e)=>s+e.amount,0);
+    const mInc = (u.incomes||[]).filter(i => (i.dateKey||'').startsWith(mk)).reduce((s,i)=>s+i.amount,0);
+    const mPct = mInc > 0 ? Math.round(mExp/mInc*100) : (inc > 0 ? Math.round(mExp/inc*100) : 0);
+
+    const remLine = rem >= 0
+        ? `✅ <b>Qolgan:</b> <code>${money(rem)}</code>`
+        : `⚠️ <b>Qolgan:</b> <code>-${money(Math.abs(rem))}</code> (ortiqcha!)`;
+
+    const last = (u.incomes||[]).slice(-3).reverse().map(i =>
+        `• <i>${esc(i.description)}</i> — <b>${money(i.amount)}</b>`
+    ).join('\n') || '<i>Yo\'q</i>';
+
+    await send(chatId,
+        `💰 <b>BALANSINGIZ</b>  —  ${esc(name)}\n\n` +
+        `📥 <b>Jami kirim:</b>   <code>${money(inc)}</code>\n` +
+        `📤 <b>Jami harajat:</b> <code>${money(exp)}</code>\n` +
+        `━━━━━━━━━━━━━━━━\n${remLine}\n\n` +
+        `📊 <b>Bu oy sarflandi:</b> ${money(mExp)} (${mPct}%)\n\n` +
+        `💵 <b>So\'nggi kirimlar:</b>\n${last}`,
+        {
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '➕ Kirim Qo\'shish', callback_data: 'income_start' },
+                    { text: '🔄 Yangilash',       callback_data: 'balance_refresh' }
+                ]]
+            }
+        }
+    );
+}
+
+// ─── TASK LIST ────────────────────────────────────────────────
+async function showTasks(chatId, name, u) {
+    const tasks = u.tasks || [];
+    if (tasks.length === 0) {
+        await send(chatId,
+            `📋 <b>Vazifalar bo\'sh.</b>\n\nYangi vazifa qo\'shish uchun ✅ Vazifa Qo\'shish tugmasini bosing.`,
+            { reply_markup: KB_MAIN }
+        );
+        return;
+    }
+    const pending = tasks.filter(t => !t.completed);
+    const done    = tasks.filter(t => t.completed);
+    let txt = `📋 <b>VAZIFALAR</b>  —  ${esc(name)}\n`;
+    if (pending.length) {
+        txt += `\n⏳ <b>Bajarilmagan (${pending.length}):</b>\n`;
+        pending.forEach(t => {
+            const dl = t.deadlineTime ? ` 🕐${t.deadlineTime}` : '';
+            txt += `• ${t.emoji} <b>${esc(t.title)}</b>${dl}\n`;
+        });
+    }
+    if (done.length) {
+        txt += `\n✅ <b>Bajarildi (${done.length}):</b>\n`;
+        done.slice(-5).forEach(t => { txt += `• ✔ <s>${esc(t.title)}</s>\n`; });
+    }
+    const buttons = pending.slice(0, 8).map(t => ([
+        { text: `✅ ${t.title.slice(0,28)}`, callback_data: `task_done_${t.id}` }
+    ]));
+    await send(chatId, txt, {
+        reply_markup: buttons.length ? { inline_keyboard: buttons } : { remove_keyboard: true }
     });
 }
 
+// ─── DAILY REPORT ─────────────────────────────────────────────
+async function showDailyReport(chatId, name, u) {
+    const td = today();
+    const list = (u.expenses||[]).filter(e => e.dateKey === td);
+    const total = list.reduce((s,e)=>s+e.amount,0);
+    const inc   = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
+    const allExp= (u.expenses||[]).reduce((s,e)=>s+e.amount,0);
+    const rem   = inc - allExp;
 
-// ============================================================
-// MAIN WEBHOOK HANDLER
-// ============================================================
+    let items = list.length
+        ? list.map((e,i)=>`${i+1}. ${esc(e.description)} — <b>${money(e.amount)}</b> <i>(${e.time})</i>`).join('\n')
+        : '<i>Bugun harajat kiritilmadi.</i>';
+
+    let balLine = '';
+    if (inc > 0) {
+        balLine = rem >= 0
+            ? `\n━━━━━━━━━━━━━━━━\n✅ <b>Qolgan balans:</b> <code>${money(rem)}</code>`
+            : `\n━━━━━━━━━━━━━━━━\n⚠️ <b>Balans:</b> <code>-${money(Math.abs(rem))}</code>`;
+    }
+
+    await send(chatId,
+        `📊 <b>KUNLIK HISOBOT</b>\n📅 <b>${dateStr()}</b>  •  ${esc(name)}\n\n` +
+        `💸 <b>Jami:</b> <code>${money(total)}</code>\n\n` +
+        `📝 <b>Harajatlar:</b>\n${items}${balLine}`,
+        { reply_markup: KB_MAIN }
+    );
+}
+
+// ─── STATISTICS ───────────────────────────────────────────────
+async function showStats(chatId, name, u, period) {
+    const now = new Date();
+    let filtered, label;
+    if (period === 'today') {
+        filtered = (u.expenses||[]).filter(e => e.dateKey === today());
+        label = '🕐 Bugungi';
+    } else if (period === 'week') {
+        const from = new Date(now); from.setDate(from.getDate()-7);
+        filtered = (u.expenses||[]).filter(e => e.dateKey && new Date(e.dateKey) >= from);
+        label = '📅 Haftalik (7 kun)';
+    } else if (period === 'month') {
+        const mk = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+        filtered = (u.expenses||[]).filter(e => (e.dateKey||'').startsWith(mk));
+        label = `🗓 Oylik (${now.toLocaleDateString('uz-UZ',{month:'long',year:'numeric'})})`;
+    } else {
+        const yr = String(now.getFullYear());
+        filtered = (u.expenses||[]).filter(e => (e.dateKey||'').startsWith(yr));
+        label = `📆 Yillik (${yr})`;
+    }
+    if (!filtered.length) {
+        await send(chatId, `📈 <b>${label}</b>\n\n<i>Bu davr uchun harajat topilmadi.</i>`, { reply_markup: KB_MAIN });
+        return;
+    }
+    const total = filtered.reduce((s,e)=>s+e.amount,0);
+    const days  = new Set(filtered.map(e=>e.dateKey)).size;
+    const avg   = Math.round(total/days);
+    const catMap = {};
+    filtered.forEach(e=>{ catMap[e.description]=(catMap[e.description]||0)+e.amount; });
+    const top = Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
+    let catTxt = top.map(([d,s],i)=>{
+        const pct = Math.round(s/total*100);
+        const bar = '█'.repeat(Math.round(pct/10))+'░'.repeat(10-Math.round(pct/10));
+        return `${i+1}. ${esc(d)}\n   ${bar} ${pct}% — <b>${money(s)}</b>`;
+    }).join('\n');
+
+    const dayMap = {};
+    filtered.forEach(e=>{ dayMap[e.dateKey]=(dayMap[e.dateKey]||0)+e.amount; });
+    const topDay = Object.entries(dayMap).sort((a,b)=>b[1]-a[1])[0];
+
+    await send(chatId,
+        `📈 <b>STATISTIKA — ${label}</b>\n👤 ${esc(name)}\n\n` +
+        `💰 <b>Jami:</b> <code>${money(total)}</code>\n` +
+        `📊 <b>Bitimlar:</b> ${filtered.length} ta\n` +
+        `📆 <b>Kunlar:</b> ${days}\n` +
+        `📉 <b>Kunlik o\'rtacha:</b> <code>${money(avg)}</code>\n` +
+        (topDay ? `🏆 <b>Eng yuqori kun:</b> ${topDay[0]} — <code>${money(topDay[1])}</code>\n` : '') +
+        `\n🏅 <b>Toifalar:</b>\n${catTxt}`,
+        {
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text:'🕐 Bugungi',  callback_data:'stat_today' },
+                        { text:'📅 Haftalik', callback_data:'stat_week' }
+                    ],
+                    [
+                        { text:'🗓 Oylik',    callback_data:'stat_month' },
+                        { text:'📆 Yillik',   callback_data:'stat_year' }
+                    ]
+                ]
+            }
+        }
+    );
+}
+
+// ─── REMINDER CHECK (har xabarda) ────────────────────────────
+async function checkReminders(chatId, u) {
+    const now = new Date();
+    const nm  = now.getHours()*60 + now.getMinutes();
+    const td  = today();
+    for (const t of (u.tasks||[])) {
+        if (t.completed || !t.deadlineMinutes || t.dateKey !== td) continue;
+        if (!t.reminderSent && t.reminderMinutes != null && nm >= t.reminderMinutes && nm < t.deadlineMinutes) {
+            t.reminderSent = true;
+            await send(chatId,
+                `⏰ <b>ESLATMA!</b>\n\n📌 <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\n` +
+                `⏱ <b>${t.deadlineMinutes-nm} daqiqa</b> qoldi (<code>${t.deadlineTime}</code>)\n\nTez bajaring! 💪`,
+                { reply_markup: { inline_keyboard: [[{ text:'✅ Bajarildi!', callback_data:`task_done_${t.id}` }]] } }
+            );
+        }
+        if (!t.deadlineSent && nm >= t.deadlineMinutes) {
+            t.deadlineSent = true;
+            await send(chatId,
+                `🔔 <b>MUDDAT TUGADI!</b>\n\n📌 <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\nBajardingizmi?`,
+                { reply_markup: { inline_keyboard: [[
+                    { text:'✅ Ha, bajardim!', callback_data:`task_done_${t.id}` },
+                    { text:'⏳ Hali yo\'q',    callback_data:`task_skip_${t.id}` }
+                ]]} }
+            );
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+//  MAIN WEBHOOK HANDLER
+// ════════════════════════════════════════════════════════════
 module.exports = async (req, res) => {
-    if (req.method !== 'POST') {
-        return res.status(200).send('Telegram Bot v4.0 (24/7) Active!');
+    res.status(200).send('OK');   // Telegram ga darhol 200 qaytarish
+
+    if (req.method !== 'POST') return;
+
+    let upd = req.body;
+    if (typeof upd === 'string') { try { upd = JSON.parse(upd); } catch(_){} }
+    if (!upd) return;
+
+    // ── Callback Query ────────────────────────────────────────
+    if (upd.callback_query) {
+        await handleCallback(upd.callback_query);
+        return;
     }
 
-    let update = req.body;
-    if (typeof update === 'string') {
-        try { update = JSON.parse(update); } catch(e) {}
-    }
+    if (!upd.message) return;
 
-    // ── Callback Query Handler (inline tugmalar) ──────────────
-    if (update && update.callback_query) {
-        await handleCallbackQuery(update.callback_query);
-        return res.status(200).send('OK');
-    }
-
-    if (!update || !update.message) return res.status(200).send('OK');
-
-    const msg = update.message;
-    const chatId = msg.chat.id;
-    const firstName = msg.from ? msg.from.first_name : 'Foydalanuvchi';
-    const host = req.headers.host || 'telgram-vazifa-bot.vercel.app';
-    const webAppUrl = `https://${host}`;
-
-    // KV dan user ma'lumotlarini yuklash
-    const user = await loadUser(chatId);
-
-    // Helper: state o'zgarishini saqlash
-    async function save() { await saveUser(chatId, user); }
+    const msg      = upd.message;
+    const chatId   = msg.chat.id;
+    const name     = (msg.from?.first_name) || 'Foydalanuvchi';
+    const u        = await getUser(chatId);
+    const save     = () => putUser(chatId, u);
 
     try {
-        // ── VOICE / AUDIO MESSAGE ─────────────────────────────
+        // ── OVOZLI XABAR ─────────────────────────────────────
         if (msg.voice || msg.audio) {
-            if (!isAuthenticated(user)) {
-                await sendAuthPrompt(chatId);
-                return res.status(200).send('OK');
-            }
-            const duration = msg.voice ? msg.voice.duration : 0;
-            user.state = 'awaiting_expense_amount_after_voice';
+            if (!isAuth(u)) { await askCode(chatId); return; }
+            u.state = 'exp_amount_voice';
+            u.pending = {};
             await save();
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `🎤 <b>Ovozli xabar qabul qilindi!</b> (${duration} sek)\n\n💰 Harajat summasini yozing:\n<i>Masalan: 50000</i>`,
-                parse_mode: 'HTML',
-                reply_markup: { remove_keyboard: true }
-            });
-            return res.status(200).send('OK');
+            await send(chatId,
+                `🎤 <b>Ovozli xabar qabul qilindi!</b> (${msg.voice?.duration||0} sek)\n\n💰 Harajat summasini yozing:`,
+                { reply_markup: KB_REMOVE }
+            );
+            return;
         }
 
-        const text = (msg.text || '').trim();
+        const text = (msg.text||'').trim();
+        if (!text) return;
 
         // ── /start ────────────────────────────────────────────
-        if (text === '/start') {
-            const today = getTodayDate();
-            if (user.authenticated && user.authDate === today) {
-                // Bugun allaqachon kirgan — to'g'ridan menuга
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `👋 <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b>\n\n📌 Pastdagi tugmalardan foydalaning:`,
-                    parse_mode: 'HTML',
-                    reply_markup: MAIN_KEYBOARD
-                });
+        if (text === '/start' || text === '/menu') {
+            if (isAuth(u)) {
+                await send(chatId,
+                    `👋 <b>Xush kelibsiz, ${esc(name)}!</b>\n\nQuyidagi tugmalardan foydalaning:`,
+                    { reply_markup: KB_MAIN }
+                );
             } else {
-                const isNewDay = user.authenticated && user.authDate && user.authDate !== today;
-                user.authenticated = false;
-                user.state = null;
-                await sendAuthPrompt(chatId, isNewDay);
+                const newDay = u.authDate && u.authDate !== today();
+                await askCode(chatId, newDay);
             }
-            return res.status(200).send('OK');
+            return;
         }
 
-        // ── AUTH CHECK ────────────────────────────────────────
-        // Keyboard tugmalari (menyu bosishlari) — kod deb qabul qilinmasin
-        const KEYBOARD_TEXTS = [
-            '💸 Harajat Qo\'shish', '✅ Vazifa Qo\'shish',
-            '📊 Kunlik Hisobot', '📋 Vazifalar Ro\'yxati',
-            '💰 Balans', '📈 Statistika', '🌐 Web Sayt',
-            '💵 Kirim Qo\'shish', '📊 Balans Ko\'rish',
-            '🍽 Taom/Oziq-ovqat', '🚕 Transport', '🛍 Xarid',
-            '💊 Sog\'liq', '💡 Kommunal', '🎬 O\'yin-kulgi', '📦 Boshqa',
-            '🔴 Juda Zarur (Bugun hal qilinishi shart)',
-            '🟡 Muhim (Imkon topilsa bajarilsin)',
-            '🟢 Oddiy (Ertaga ham bo\'ladi)',
-            '⏰ 09:00', '⏰ 12:00', '⏰ 15:00',
-            '⏰ 18:00', '⏰ 20:00', '⏰ 22:00',
-            '📅 Muddatsiz (Eslatma yo\'q)',
-            '🔐 Kodni Kiritish'
-        ];
-
-
-        if (!isAuthenticated(user)) {
+        // ── AUTH GATE ─────────────────────────────────────────
+        if (!isAuth(u)) {
             if (text === SECRET_CODE) {
-                user.authenticated = true;
-                user.authDate = getTodayDate();
-                user.wrongAttempts = 0;
+                // ✅ To'g'ri kod
+                u.authDate      = today();
+                u.wrongAttempts = 0;
                 await save();
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `✅ <b>Xush kelibsiz, ${escapeHtml(firstName)}!</b> 🎉\n\n🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n📌 Bugun siz uchun:\n💸 Harajat qo'shing\n✅ Vazifa belgilang\n📊 Hisobot ko'ring\n\n<i>✅ Bugun yana kod so'ralmaydi. Faqat ertaga 1 marta so'raladi.</i>`,
-                    parse_mode: 'HTML',
-                    reply_markup: MAIN_KEYBOARD
-                });
-            } else if (KEYBOARD_TEXTS.includes(text) || text.startsWith('/') || text.startsWith('⏰')) {
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `🔐 <b>Kunlik tasdiqlash kerak.</b>\n\nKodingizni kiriting:`,
-                    parse_mode: 'HTML',
-                    reply_markup: { remove_keyboard: true }
-                });
-            } else if (text.length > 0) {
-                user.wrongAttempts = (user.wrongAttempts || 0) + 1;
+                await send(chatId,
+                    `✅ <b>Xush kelibsiz, ${esc(name)}!</b> 🎉\n\n` +
+                    `🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n` +
+                    `📌 Bugun siz uchun:\n` +
+                    `  💸 Harajat qo\'shing\n` +
+                    `  ✅ Vazifa belgilang\n` +
+                    `  💰 Balans ko\'ring\n\n` +
+                    `<i>✅ Bugun yana kod so\'ralmaydi.</i>`,
+                    { reply_markup: KB_MAIN }
+                );
+            } else if (MENU_TEXTS.has(text) || text.startsWith('/') || isNumeric(text)) {
+                // Tugma yoki raqam → "kod kiriting" (xato dema!)
+                const newDay = u.authDate && u.authDate !== today();
+                await askCode(chatId, newDay);
+            } else {
+                // Haqiqiy noto'g'ri kod
+                u.wrongAttempts = (u.wrongAttempts||0) + 1;
                 await save();
-                if (user.wrongAttempts >= 5) {
-                    await sendTelegramApi('sendMessage', {
-                        chat_id: chatId,
-                        text: `🚫 <b>Juda ko'p noto'g'ri urinish!</b>\n\nQayta urinish uchun /start yozing.`,
-                        parse_mode: 'HTML'
-                    });
-                    user.wrongAttempts = 0;
+                if (u.wrongAttempts >= 5) {
+                    u.wrongAttempts = 0;
                     await save();
+                    await send(chatId, `🚫 <b>Juda ko\'p noto\'g\'ri urinish!</b>\n\n/start yozib qayta urinib ko\'ring.`);
                 } else {
-                    await sendTelegramApi('sendMessage', {
-                        chat_id: chatId,
-                        text: `❌ <b>Kod noto'g'ri!</b>\n<i>Qolgan urinish: ${5 - user.wrongAttempts} ta</i>`,
-                        parse_mode: 'HTML'
-                    });
+                    await send(chatId, `❌ <b>Kod noto\'g\'ri!</b>\n<i>Qolgan urinish: ${5-u.wrongAttempts} ta</i>`);
                 }
             }
-            return res.status(200).send('OK');
+            return;
         }
 
+        // ════ AUTENTIFIKATSIYA MUVAFFAQIYATLI ════════════════
 
-        // ── MAIN MENU BUTTONS ─────────────────────────────────
+        // Har xabarda eslatmalarni tekshir
+        await checkReminders(chatId, u);
+
+        // ── ASOSIY MENYU TUGMALARI ────────────────────────────
 
         if (text === '💸 Harajat Qo\'shish') {
-            user.state = 'awaiting_expense_amount';
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `💸 <b>Harajat Qo'shish</b>\n\nSummasini kiriting:\n<i>Masalan: 50000</i>`,
-                parse_mode: 'HTML',
-                reply_markup: { remove_keyboard: true }
-            });
-            return res.status(200).send('OK');
-        }
-
-        if (text === '📊 Kunlik Hisobot' || text === '/hisobot') {
-            user.state = null;
-            await sendDailyReport(chatId, firstName, user);
-            return res.status(200).send('OK');
+            u.state = 'exp_amount'; u.pending = {};
+            await save();
+            await send(chatId, `💸 <b>Harajat Qo\'shish</b>\n\nSummasini kiriting:\n<i>Masalan: 50 000</i>`, { reply_markup: KB_REMOVE });
+            return;
         }
 
         if (text === '✅ Vazifa Qo\'shish') {
-            user.state = 'awaiting_task_title';
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `✅ <b>Yangi Vazifa</b>\n\nSarlavhasini kiriting:\n<i>Masalan: Kitob o'qish</i>`,
-                parse_mode: 'HTML',
-                reply_markup: { remove_keyboard: true }
-            });
-            return res.status(200).send('OK');
+            u.state = 'task_title'; u.pending = {};
+            await save();
+            await send(chatId, `✅ <b>Yangi Vazifa</b>\n\nVazifa nomini yozing:\n<i>Masalan: Hisobot tayyorlash</i>`, { reply_markup: KB_REMOVE });
+            return;
+        }
+
+        if (text === '📊 Kunlik Hisobot' || text === '/hisobot') {
+            u.state = null; await save();
+            await showDailyReport(chatId, name, u);
+            return;
         }
 
         if (text === '📋 Vazifalar Ro\'yxati' || text === '/vazifalar') {
-            user.state = null;
-            await sendTaskList(chatId, firstName, user);
-            return res.status(200).send('OK');
-        }
-
-        if (text === '📈 Statistika' || text === '/stat') {
-            user.state = null;
-            // Davr tanlash tugmalari chiqar
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `📈 <b>Statistika</b>\n\nQaysi davr uchun ko'rmoqchisiz?`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '📅 Haftalik', callback_data: 'stat_week' },
-                            { text: '🗓 Oylik',    callback_data: 'stat_month' },
-                            { text: '📆 Yillik',   callback_data: 'stat_year' }
-                        ],
-                        [
-                            { text: '🕐 Bugungi',  callback_data: 'stat_today' }
-                        ]
-                    ]
-                }
-            });
-            return res.status(200).send('OK');
+            u.state = null; await save();
+            await showTasks(chatId, name, u);
+            return;
         }
 
         if (text === '💰 Balans' || text === '/balans') {
-            user.state = null;
-            await sendBalanceSummary(chatId, firstName, user);
-            return res.status(200).send('OK');
+            u.state = null; await save();
+            await showBalance(chatId, name, u);
+            return;
         }
 
         if (text === '💵 Kirim Qo\'shish') {
-            user.state = 'awaiting_income_amount';
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `💵 <b>Kirim Qo'shish</b>\n\nNecha so'm qo'shmoqchisiz?\n<i>Masalan: 2 500 000</i>`,
-                parse_mode: 'HTML',
-                reply_markup: { remove_keyboard: true }
-            });
-            return res.status(200).send('OK');
+            u.state = 'inc_amount'; u.pending = {};
+            await save();
+            await send(chatId, `💵 <b>Kirim Qo\'shish</b>\n\nNecha so\'m qo\'shmoqchisiz?\n<i>Masalan: 2 500 000</i>`, { reply_markup: KB_REMOVE });
+            return;
         }
 
-
-        if (text === '🌐 Web Sayt') {
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `🌐 <b>Web Ilovani Ochish</b>`,
-                parse_mode: 'HTML',
+        if (text === '📈 Statistika' || text === '/stat') {
+            u.state = null; await save();
+            await send(chatId, `📈 <b>Statistika</b>\n\nQaysi davr uchun ko\'rmoqchisiz?`, {
                 reply_markup: {
-                    inline_keyboard: [[
-                        { text: '🌐 Web Saytni Ochish', web_app: { url: webAppUrl } }
-                    ]]
+                    inline_keyboard: [
+                        [
+                            { text:'📅 Haftalik', callback_data:'stat_week' },
+                            { text:'🗓 Oylik',    callback_data:'stat_month' },
+                            { text:'📆 Yillik',   callback_data:'stat_year' }
+                        ],
+                        [{ text:'🕐 Bugungi', callback_data:'stat_today' }]
+                    ]
                 }
             });
-            return res.status(200).send('OK');
+            return;
         }
 
         // ── STATE MACHINE ─────────────────────────────────────
 
-        // Summa kiritish (harajat yoki ovozdan keyin)
-        if (user.state === 'awaiting_expense_amount' ||
-            user.state === 'awaiting_expense_amount_after_voice') {
-            const amount = parseAmount(text);
-            if (amount) {
-                user.pendingAmount = amount;
-                user.state = 'awaiting_expense_desc';
+        // HARAJAT: summa
+        if (u.state === 'exp_amount' || u.state === 'exp_amount_voice') {
+            const n = parseNum(text);
+            if (n) {
+                u.pending.amount = n;
+                u.state = 'exp_desc';
                 await save();
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `💰 Summa: <b>${formatMoney(amount)}</b>\n\n❓ <b>Nima uchun sarflandi?</b>\nToifa tanlang yoki o'zingiz yozing:`,
-                    parse_mode: 'HTML',
-                    reply_markup: CATEGORY_KEYBOARD
-                });
+                await send(chatId,
+                    `💰 Summa: <b>${money(n)}</b>\n\n❓ <b>Nima uchun sarflandi?</b>\nToifa tanlang yoki yozing:`,
+                    { reply_markup: KB_CATEGORY }
+                );
             } else {
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `❗ Faqat <b>raqam</b> kiriting.\n<i>Masalan: 50000</i>`,
-                    parse_mode: 'HTML'
-                });
+                await send(chatId, `❗ Faqat <b>raqam</b> kiriting.\n<i>Masalan: 50000</i>`);
             }
-            return res.status(200).send('OK');
+            return;
         }
 
-
-        // Izoh / toifa kiritish
-        if (user.state === 'awaiting_expense_desc') {
-            const amount = user.pendingAmount;
+        // HARAJAT: izoh/toifa
+        if (u.state === 'exp_desc') {
+            const amount = u.pending.amount;
             if (amount && text) {
-                if (!user.incomes) user.incomes = [];
-                user.expenses.push({
-                    id: Date.now().toString(),
-                    amount,
-                    description: text,
-                    date: getTodayStr(),
-                    dateKey: getTodayDate(),
-                    time: getTimeStr()
-                });
-                user.pendingAmount = null;
-                user.state = null;
+                if (!u.incomes) u.incomes = [];
+                u.expenses.push({ id: Date.now().toString(), amount, description: text, date: dateStr(), dateKey: today(), time: timeStr() });
+                u.pending = {}; u.state = null;
                 await save();
 
-                const todayTotal = user.expenses
-                    .filter(e => e.dateKey === getTodayDate())
-                    .reduce((s, e) => s + e.amount, 0);
+                const todayExp = u.expenses.filter(e=>e.dateKey===today()).reduce((s,e)=>s+e.amount,0);
+                const totalInc = u.incomes.reduce((s,i)=>s+i.amount,0);
+                const totalExp = u.expenses.reduce((s,e)=>s+e.amount,0);
+                const rem = totalInc - totalExp;
 
-                // Balans hisoblash
-                const totalIncome = user.incomes.reduce((s, i) => s + i.amount, 0);
-                const totalExpense = user.expenses.reduce((s, e) => s + e.amount, 0);
-                const remaining = totalIncome - totalExpense;
-
-                let balanceStr = '';
-                if (totalIncome > 0) {
-                    const remainingLine = remaining >= 0
-                        ? `✅ Qolgan balans: <b>${formatMoney(remaining)}</b>`
-                        : `⚠️ Balans: <b>-${formatMoney(Math.abs(remaining))}</b> (ortiqcha sarflandi!)`;
-                    balanceStr = `\n\n━━━━━━━━━━━━━━━━\n${remainingLine}`;
+                let balLine = '';
+                if (totalInc > 0) {
+                    balLine = rem >= 0
+                        ? `\n━━━━━━━━━━━━━━━━\n✅ <b>Qolgan balans:</b> <code>${money(rem)}</code>`
+                        : `\n━━━━━━━━━━━━━━━━\n⚠️ <b>Balans:</b> <code>-${money(Math.abs(rem))}</code> (ortiqcha!)`;
                 }
 
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `✅ <b>Harajat Saqlandi!</b>\n\n💵 <b>Summa:</b> ${formatMoney(amount)}\n📝 <b>Izoh:</b> ${escapeHtml(text)}\n🕐 <b>Vaqt:</b> ${getTimeStr()}\n\n📊 <b>Bugungi jami harajat:</b> <code>${formatMoney(todayTotal)}</code>${balanceStr}`,
-                    parse_mode: 'HTML',
-                    reply_markup: MAIN_KEYBOARD
-                });
+                await send(chatId,
+                    `✅ <b>Harajat saqlandi!</b>\n\n` +
+                    `💵 <b>Summa:</b> ${money(amount)}\n` +
+                    `📝 <b>Izoh:</b> ${esc(text)}\n` +
+                    `🕐 <b>Vaqt:</b> ${timeStr()}\n\n` +
+                    `📊 <b>Bugungi jami:</b> <code>${money(todayExp)}</code>${balLine}`,
+                    { reply_markup: KB_MAIN }
+                );
             }
-            return res.status(200).send('OK');
+            return;
         }
 
-        // Kirim miqdori (balans to'ldirish)
-        if (user.state === 'awaiting_income_amount') {
-            const amount = parseAmount(text);
-            if (amount) {
-                if (!user.incomes) user.incomes = [];
-                user.pendingIncomeAmount = amount;
-                user.state = 'awaiting_income_desc';
+        // KIRIM: summa
+        if (u.state === 'inc_amount') {
+            const n = parseNum(text);
+            if (n) {
+                u.pending.amount = n;
+                u.state = 'inc_desc';
                 await save();
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `💵 Miqdor: <b>${formatMoney(amount)}</b>\n\n📝 Bu kirimni izohlab bering:\n<i>Masalan: Oylik maosh, Bonus, Savdo daromadi</i>`,
-                    parse_mode: 'HTML',
-                    reply_markup: {
-                        keyboard: [
-                            ['💼 Oylik maosh', '🎁 Bonus'],
-                            ['🛒 Savdo daromadi', '📦 Boshqa kirim']
-                        ],
-                        resize_keyboard: true,
-                        one_time_keyboard: true
-                    }
-                });
+                await send(chatId, `💵 Miqdor: <b>${money(n)}</b>\n\n📝 Izoh kiriting:`, { reply_markup: KB_INCOME_CAT });
             } else {
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `❗ Faqat <b>raqam</b> kiriting.\n<i>Masalan: 2500000</i>`,
-                    parse_mode: 'HTML'
-                });
+                await send(chatId, `❗ Faqat <b>raqam</b> kiriting.\n<i>Masalan: 2500000</i>`);
             }
-            return res.status(200).send('OK');
+            return;
         }
 
-        // Kirim izohi
-        if (user.state === 'awaiting_income_desc') {
-            const amount = user.pendingIncomeAmount;
+        // KIRIM: izoh
+        if (u.state === 'inc_desc') {
+            const amount = u.pending.amount;
             if (amount && text) {
-                if (!user.incomes) user.incomes = [];
-                user.incomes.push({
-                    id: Date.now().toString(),
-                    amount,
-                    description: text,
-                    date: getTodayStr(),
-                    dateKey: getTodayDate(),
-                    time: getTimeStr()
-                });
-                user.pendingIncomeAmount = null;
-                user.state = null;
+                if (!u.incomes) u.incomes = [];
+                u.incomes.push({ id: Date.now().toString(), amount, description: text, date: dateStr(), dateKey: today(), time: timeStr() });
+                u.pending = {}; u.state = null;
                 await save();
 
-                const totalIncome = user.incomes.reduce((s, i) => s + i.amount, 0);
-                const totalExpense = user.expenses.reduce((s, e) => s + e.amount, 0);
-                const remaining = totalIncome - totalExpense;
+                const totalInc = u.incomes.reduce((s,i)=>s+i.amount,0);
+                const totalExp = u.expenses.reduce((s,e)=>s+e.amount,0);
+                const rem = totalInc - totalExp;
 
-                await sendTelegramApi('sendMessage', {
-                    chat_id: chatId,
-                    text: `✅ <b>Kirim Saqlandi!</b>\n\n💵 <b>Summa:</b> ${formatMoney(amount)}\n📝 <b>Izoh:</b> ${escapeHtml(text)}\n\n━━━━━━━━━━━━━━━━\n📥 <b>Jami kirim:</b> ${formatMoney(totalIncome)}\n📤 <b>Jami harajat:</b> ${formatMoney(totalExpense)}\n✅ <b>Qolgan balans:</b> <code>${formatMoney(remaining)}</code>`,
-                    parse_mode: 'HTML',
-                    reply_markup: MAIN_KEYBOARD
-                });
+                await send(chatId,
+                    `✅ <b>Kirim saqlandi!</b>\n\n` +
+                    `💵 <b>Summa:</b> ${money(amount)}\n` +
+                    `📝 <b>Izoh:</b> ${esc(text)}\n\n` +
+                    `━━━━━━━━━━━━━━━━\n` +
+                    `📥 <b>Jami kirim:</b>   <code>${money(totalInc)}</code>\n` +
+                    `📤 <b>Jami harajat:</b> <code>${money(totalExp)}</code>\n` +
+                    `✅ <b>Qolgan:</b>        <code>${money(rem)}</code>`,
+                    { reply_markup: KB_MAIN }
+                );
             }
-            return res.status(200).send('OK');
+            return;
         }
 
-
-
-        // Vazifa sarlavhasi
-        if (user.state === 'awaiting_task_title') {
-            user.pendingTaskTitle = text;
-            user.state = 'awaiting_task_priority';
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `📝 <b>Vazifa:</b> <i>${escapeHtml(text)}</i>\n\n⚡ <b>Qay darajada zarur?</b>`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    keyboard: [
-                        ['🔴 Juda Zarur (Bugun hal qilinishi shart)'],
-                        ['🟡 Muhim (Imkon topilsa bajarilsin)'],
-                        ['🟢 Oddiy (Ertaga ham bo\'ladi)']
-                    ],
-                    resize_keyboard: true,
-                    one_time_keyboard: true
-                }
-            });
-            return res.status(200).send('OK');
+        // VAZIFA: sarlavha
+        if (u.state === 'task_title') {
+            u.pending.title = text;
+            u.state = 'task_priority';
+            await save();
+            await send(chatId, `📝 <b>Vazifa:</b> <i>${esc(text)}</i>\n\n⚡ <b>Qay darajada zarur?</b>`, { reply_markup: KB_PRIORITY });
+            return;
         }
 
-        // Vazifa muhimligi
-        if (user.state === 'awaiting_task_priority') {
-            let priority = 'medium', emoji = '🟡', label = "Muhim";
-            if (text.includes('Juda Zarur') || text.includes('🔴')) { priority='high'; emoji='🔴'; label='Juda Zarur'; }
-            else if (text.includes('Oddiy') || text.includes('🟢')) { priority='low'; emoji='🟢'; label='Oddiy'; }
-
-            user.pendingTaskPriority = { priority, emoji, label };
-            user.state = 'awaiting_task_time';
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `${emoji} <b>${label}</b>\n\n🕐 <b>Vazifani qaysi soatga bajarish kerak?</b>\n\nVaqtni kiriting (24 soatlik format):\n<i>Masalan: 14:30 yoki 09:00</i>\n\nYoki «Bugun» yoki «Ertaga» tanlang:`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    keyboard: [
-                        ['⏰ 09:00', '⏰ 12:00', '⏰ 15:00'],
-                        ['⏰ 18:00', '⏰ 20:00', '⏰ 22:00'],
-                        ['📅 Muddatsiz (Eslatma yo\'q)']
-                    ],
-                    resize_keyboard: true,
-                    one_time_keyboard: true
-                }
-            });
-            return res.status(200).send('OK');
+        // VAZIFA: muhimlik
+        if (u.state === 'task_priority') {
+            let emoji='🟡', label='Muhim', priority='medium';
+            if (text.includes('Juda Zarur')||text.includes('🔴')) { emoji='🔴'; label='Juda Zarur'; priority='high'; }
+            else if (text.includes('Oddiy')||text.includes('🟢')) { emoji='🟢'; label='Oddiy'; priority='low'; }
+            u.pending.priority = { emoji, label, priority };
+            u.state = 'task_time';
+            await save();
+            await send(chatId,
+                `${emoji} <b>${label}</b>\n\n🕐 <b>Qaysi soatga bajarilishi kerak?</b>`,
+                { reply_markup: KB_TIME }
+            );
+            return;
         }
 
-        // Vazifa vaqti
-        if (user.state === 'awaiting_task_time') {
-            const taskId = Date.now().toString();
-            const taskTitle = user.pendingTaskTitle;
-            const { priority, emoji, label } = user.pendingTaskPriority || { priority:'medium', emoji:'🟡', label:"Muhim" };
+        // VAZIFA: vaqt
+        if (u.state === 'task_time') {
+            const { title, priority: pr } = u.pending;
+            const { emoji, label, priority } = pr || { emoji:'🟡', label:'Muhim', priority:'medium' };
 
-            // Vaqtni parse qilish
-            let deadlineTime = null;
-            let deadlineMinutes = null;
-            let timeDisplay = '📅 Muddatsiz';
-
-            if (text !== '📅 Muddatsiz (Eslatma yo\'q)') {
-                // "⏰ 14:30" yoki "14:30" formatidan vaqt ajratish
-                const timeMatch = text.replace('⏰', '').trim().match(/^(\d{1,2}):(\d{2})$/);
-                if (timeMatch) {
-                    const hours = parseInt(timeMatch[1]);
-                    const minutes = parseInt(timeMatch[2]);
-                    if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
-                        deadlineTime = `${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}`;
-                        deadlineMinutes = hours * 60 + minutes;
-                        timeDisplay = `🕐 ${deadlineTime}`;
+            let deadlineTime=null, deadlineMinutes=null, reminderMinutes=null;
+            if (text !== '📅 Vaqtsiz (eslatma yo\'q)') {
+                const m = text.replace('⏰','').trim().match(/^(\d{1,2}):(\d{2})$/);
+                if (m) {
+                    const h=parseInt(m[1]), min=parseInt(m[2]);
+                    if (h>=0&&h<=23&&min>=0&&min<=59) {
+                        deadlineTime    = `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}`;
+                        deadlineMinutes = h*60+min;
+                        reminderMinutes = deadlineMinutes - 30;
                     }
                 }
             }
 
-            const now = new Date();
-            const nowMinutes = now.getHours() * 60 + now.getMinutes();
+            const task = {
+                id: Date.now().toString(), title, priority, emoji, label,
+                date: dateStr(), dateKey: today(), time: timeStr(),
+                deadlineTime, deadlineMinutes, reminderMinutes,
+                reminderSent: false, deadlineSent: false, completed: false
+            };
+            u.tasks.push(task);
+            u.pending = {}; u.state = null;
+            await save();
 
-            // Reminder vaqti: deadline'dan 30 daqiqa oldin
-            let reminderMinutes = deadlineMinutes !== null ? deadlineMinutes - 30 : null;
-
-            user.tasks.push({
-                id: taskId,
-                title: taskTitle,
-                priority, emoji, label,
-                date: getTodayStr(),
-                dateKey: getTodayDate(),
-                time: getTimeStr(),
-                deadlineTime,
-                deadlineMinutes,
-                reminderMinutes,
-                reminderSent: false,
-                deadlineSent: false,
-                completed: false
-            });
-            user.pendingTaskTitle = null;
-            user.pendingTaskPriority = null;
-            user.state = null;
-
-            let confirmText = `✅ <b>Vazifa Qo'shildi!</b>\n\n📌 <b>${escapeHtml(taskTitle)}</b>\n${emoji} <b>Zarurlik:</b> ${label}\n${timeDisplay}`;
-            if (deadlineTime) {
-                confirmText += `\n⏰ <b>Eslatma:</b> ${deadlineTime} dan 30 daqiqa oldin xabar beraman!`;
-            }
-
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: confirmText,
-                parse_mode: 'HTML',
-                reply_markup: MAIN_KEYBOARD
-            });
-            return res.status(200).send('OK');
+            let txt = `✅ <b>Vazifa qo\'shildi!</b>\n\n📌 <b>${esc(title)}</b>\n${emoji} ${label}`;
+            if (deadlineTime) txt += `\n🕐 ${deadlineTime} — eslatma 30 daqiqa oldin! ⏰`;
+            await send(chatId, txt, { reply_markup: KB_MAIN });
+            return;
         }
 
-        // ── REMINDER CHECK (har xabarda) ─────────────────────
-        await checkAndSendReminders(chatId, user);
-
-        // Raqam yuborsа (state yo'q)
-        const detected = parseAmount(text);
-        if (detected) {
-            user.pendingAmount = detected;
-            user.state = 'awaiting_expense_desc';
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `💰 Summa: <b>${formatMoney(detected)}</b>\n\n❓ <b>Nima uchun sarflandi?</b>`,
-                parse_mode: 'HTML',
-                reply_markup: CATEGORY_KEYBOARD
-            });
-            return res.status(200).send('OK');
+        // Raqam yozilsa — harajat sifatida qabul qil
+        if (isNumeric(text)) {
+            const n = parseNum(text);
+            if (n) {
+                u.pending = { amount: n };
+                u.state = 'exp_desc';
+                await save();
+                await send(chatId,
+                    `💰 Summa: <b>${money(n)}</b>\n\n❓ <b>Nima uchun sarflandi?</b>\nToifa tanlang yoki yozing:`,
+                    { reply_markup: KB_CATEGORY }
+                );
+                return;
+            }
         }
 
         // Default
-        await sendTelegramApi('sendMessage', {
-            chat_id: chatId,
-            text: `💡 Pastdagi tugmalardan foydalaning yoki harajat summasini yozing.`,
-            parse_mode: 'HTML',
-            reply_markup: MAIN_KEYBOARD
-        });
+        await send(chatId,
+            `💡 Harajat qo\'shish uchun raqam yozing yoki quyidagi tugmalardan foydalaning:`,
+            { reply_markup: KB_MAIN }
+        );
 
     } catch (err) {
-        console.error('Bot error:', err);
+        console.error('Bot error:', err?.message || err);
     }
-
-    return res.status(200).send('OK');
 };
 
-// ============================================================
-// REMINDER CHECKER — har xabarda tekshiriladi
-// ============================================================
-async function checkAndSendReminders(chatId, user) {
-    const now = new Date();
-    const nowMinutes = now.getHours() * 60 + now.getMinutes();
-    const today = getTodayDate();
-
-    for (const task of user.tasks) {
-        if (task.completed || !task.deadlineMinutes) continue;
-        if (task.dateKey !== today) continue;
-
-        // 30 daqiqa oldin eslatma
-        if (!task.reminderSent &&
-            task.reminderMinutes !== null &&
-            nowMinutes >= task.reminderMinutes &&
-            nowMinutes < task.deadlineMinutes) {
-            task.reminderSent = true;
-            const remaining = task.deadlineMinutes - nowMinutes;
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `⏰ <b>ESLATMA!</b>\n\n📌 <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label}\n\n⏱ <b>${remaining} daqiqadan keyin</b> (<code>${task.deadlineTime}</code>) muddat tugaydi!\n\nTez bajaring! 💪`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: '✅ Bajarildi!', callback_data: `done_task_${task.id}` }
-                    ]]
-                }
-            });
-        }
-
-        // Muddat o'tganida ham eslatma
-        if (!task.deadlineSent && nowMinutes >= task.deadlineMinutes) {
-            task.deadlineSent = true;
-            await sendTelegramApi('sendMessage', {
-                chat_id: chatId,
-                text: `🔔 <b>MUDDAT TUGADI!</b>\n\n📌 <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label}\n\n⏰ <code>${task.deadlineTime}</code> — muddat tugagan!\n\nVazifani bajardingizmi?`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: '✅ Ha, bajardim!', callback_data: `done_task_${task.id}` },
-                        { text: '⏳ Hali yo\'q', callback_data: `skip_task_${task.id}` }
-                    ]]
-                }
-            });
-        }
-    }
-}
-
-
-// ============================================================
-// ============================================================
-// BALANCE SUMMARY
-// ============================================================
-async function sendBalanceSummary(chatId, firstName, user) {
-    if (!user.incomes) user.incomes = [];
-    const totalIncome = user.incomes.reduce((s, i) => s + i.amount, 0);
-    const totalExpense = user.expenses.reduce((s, e) => s + e.amount, 0);
-    const remaining = totalIncome - totalExpense;
-
-    if (totalIncome === 0) {
-        await sendTelegramApi('sendMessage', {
-            chat_id: chatId,
-            text: `💰 <b>Balansingiz</b>\n\n<i>Hali kirim qo'shilmagan.</i>\n\nBirinchi kirimingizni qo'shing:`,
-            parse_mode: 'HTML',
-            reply_markup: {
-                keyboard: [
-                    ['💵 Kirim Qo\'shish'],
-                    ['🔙 Orqaga']
-                ],
-                resize_keyboard: true
-            }
-        });
-        return;
-    }
-
-    // Oylik foiz
-    const now = new Date();
-    const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-    const monthIncome = user.incomes.filter(i => i.dateKey && i.dateKey.startsWith(monthKey)).reduce((s,i)=>s+i.amount,0);
-    const monthExpense = user.expenses.filter(e => e.dateKey && e.dateKey.startsWith(monthKey)).reduce((s,e)=>s+e.amount,0);
-
-    const percentSpent = totalIncome > 0 ? Math.round((totalExpense / totalIncome) * 100) : 0;
-    const monthPercentSpent = monthIncome > 0 ? Math.round((monthExpense / monthIncome) * 100) : 0;
-
-    const remainingEmoji = remaining >= 0 ? '✅' : '⚠️';
-    const remainingText = remaining >= 0
-        ? `${formatMoney(remaining)}`
-        : `-${formatMoney(Math.abs(remaining))} ⚠️`;
-
-    // So'nggi 3 kirim
-    const lastIncomes = user.incomes.slice(-3).reverse();
-    let incomesText = '';
-    lastIncomes.forEach(i => {
-        incomesText += `\n  • ${escapeHtml(i.description)} — <b>${formatMoney(i.amount)}</b> <i>(${i.date})</i>`;
-    });
-
-    await sendTelegramApi('sendMessage', {
-        chat_id: chatId,
-        text: `💰 <b>Balansingiz</b>\n👤 <b>${escapeHtml(firstName)}</b>\n\n📥 <b>Jami kirim:</b> <code>${formatMoney(totalIncome)}</code>\n📤 <b>Jami harajat:</b> <code>${formatMoney(totalExpense)}</code>\n━━━━━━━━━━━━━━━━\n${remainingEmoji} <b>Qolgan:</b> <code>${remainingText}</code>\n\n📊 <b>Bu oy:</b> -${formatMoney(monthExpense)} (${monthPercentSpent}%)\n📈 <b>Jami sarflangan:</b> ${percentSpent}%\n\n💵 <b>So'nggi kirimlar:</b>${incomesText || '\n  <i>Yo\'q</i>'}`,
-        parse_mode: 'HTML',
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: '➕ Kirim Qo\'shish', callback_data: 'add_income' },
-                    { text: '🔄 Yangilash', callback_data: 'refresh_balance' }
-                ]
-            ]
-        }
-    });
-}
-
-// ============================================================
-// CALLBACK QUERY — Inline tugmalar (Bajarildi / O'chirish)
-// ============================================================
-async function handleCallbackQuery(cq) {
+// ════════════════════════════════════════════════════════════
+//  CALLBACK QUERY HANDLER
+// ════════════════════════════════════════════════════════════
+async function handleCallback(cq) {
     const chatId = cq.message.chat.id;
-    const data = cq.data || '';
-    const user = await loadUser(chatId);
-    async function save() { await saveUser(chatId, user); }
+    const data   = cq.data || '';
+    const name   = cq.from?.first_name || 'Foydalanuvchi';
+    const u      = await getUser(chatId);
+    const save   = () => putUser(chatId, u);
 
+    const ack = (text='') => tgReq('answerCallbackQuery', { callback_query_id: cq.id, text, show_alert: false });
 
-    if (data.startsWith('done_task_')) {
-        const taskId = data.replace('done_task_', '');
-        const task = user.tasks.find(t => t.id === taskId);
-        if (task) {
-            task.completed = !task.completed;
-            const status = task.completed ? '✅ Bajarildi' : '⏳ Qayta ochildi';
-            await sendTelegramApi('answerCallbackQuery', {
-                callback_query_id: cq.id,
-                text: status,
-                show_alert: false
-            });
-            await sendTelegramApi('editMessageText', {
-                chat_id: chatId,
-                message_id: cq.message.message_id,
-                text: `${task.completed ? '✅' : '⏳'} <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label} | 🕐 ${task.time}`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: task.completed ? '↩️ Qayta Ochish' : '✅ Bajarildi', callback_data: `done_task_${taskId}` }
-                    ]]
-                }
-            });
-        }
+    // Statistika
+    if (['stat_today','stat_week','stat_month','stat_year'].includes(data)) {
+        const map = { stat_today:'today', stat_week:'week', stat_month:'month', stat_year:'year' };
+        await ack('Yuklanmoqda...');
+        await showStats(chatId, name, u, map[data]);
+        return;
     }
 
+    // Vazifa bajarildi
+    if (data.startsWith('task_done_')) {
+        const id = data.slice(10);
+        const t = (u.tasks||[]).find(t=>t.id===id);
+        if (t) {
+            t.completed = !t.completed;
+            await save();
+            await ack(t.completed ? '✅ Bajarildi!' : '↩️ Qayta ochildi');
+            await tgReq('editMessageText', {
+                chat_id: chatId, message_id: cq.message.message_id,
+                text: `${t.completed?'✅':'⏳'} <b>${esc(t.title)}</b>\n${t.emoji} ${t.label} | 🕐 ${t.time}`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: t.completed?'↩️ Qayta Ochish':'✅ Bajarildi', callback_data:`task_done_${id}` }]] }
+            });
+        }
+        return;
+    }
+
+    // Vazifa skip
+    if (data.startsWith('task_skip_')) {
+        const id = data.slice(10);
+        const t = (u.tasks||[]).find(t=>t.id===id);
+        await ack('⏳ Keyinroq bajaring!');
+        if (t) {
+            await tgReq('editMessageText', {
+                chat_id: chatId, message_id: cq.message.message_id,
+                text: `⏳ <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\n<i>Hali bajarilmadi.</i>`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text:'✅ Bajarildi!', callback_data:`task_done_${id}` }]] }
+            });
+        }
+        return;
+    }
+
+    // Harajat o'chirish
     if (data.startsWith('del_exp_')) {
-        const expId = data.replace('del_exp_', '');
-        user.expenses = user.expenses.filter(e => e.id !== expId);
-        await sendTelegramApi('answerCallbackQuery', {
-            callback_query_id: cq.id,
-            text: "🗑 Harajat o'chirildi",
-            show_alert: false
-        });
-        await sendTelegramApi('deleteMessage', {
-            chat_id: chatId,
-            message_id: cq.message.message_id
-        });
-    }
-
-    // Statistika davr tugmalari
-    if (data === 'stat_today' || data === 'stat_week' || data === 'stat_month' || data === 'stat_year') {
-        const periodMap = { stat_today: 'today', stat_week: 'week', stat_month: 'month', stat_year: 'year' };
-        const labelMap = { stat_today: '🕐 Bugungi', stat_week: '📅 Haftalik', stat_month: '🗓 Oylik', stat_year: '📆 Yillik' };
-        await sendTelegramApi('answerCallbackQuery', {
-            callback_query_id: cq.id,
-            text: `${labelMap[data]} statistika yuklanmoqda...`,
-            show_alert: false
-        });
-        const firstName = cq.from ? cq.from.first_name : 'Foydalanuvchi';
-        await sendStatistics(chatId, firstName, user, periodMap[data]);
-    }
-
-    // Hali bajarilmadi tugmasi
-    if (data.startsWith('skip_task_')) {
-        const taskId = data.replace('skip_task_', '');
-        const task = user.tasks.find(t => t.id === taskId);
-        await sendTelegramApi('answerCallbackQuery', {
-            callback_query_id: cq.id,
-            text: "⏳ Yaxshi, keyinroq bajaring!",
-            show_alert: false
-        });
-        if (task) {
-            await sendTelegramApi('editMessageText', {
-                chat_id: chatId,
-                message_id: cq.message.message_id,
-                text: `⏳ <b>${escapeHtml(task.title)}</b>\n${task.emoji} ${task.label}\n\n<i>Hali bajarilmadi. Tez orada bajarishni unutmang!</i>`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: '✅ Bajarildi!', callback_data: `done_task_${taskId}` }
-                    ]]
-                }
-            });
-        }
-    }
-
-    // Balans callback tugmalari
-    if (data === 'add_income') {
-        await sendTelegramApi('answerCallbackQuery', {
-            callback_query_id: cq.id,
-            text: 'Kirim qo\'shish...',
-            show_alert: false
-        });
-        user.state = 'awaiting_income_amount';
+        const id = data.slice(8);
+        u.expenses = (u.expenses||[]).filter(e=>e.id!==id);
         await save();
-        await sendTelegramApi('sendMessage', {
-            chat_id: chatId,
-            text: `💵 <b>Kirim Qo'shish</b>\n\nNecha so'm qo'shmoqchisiz?\n<i>Masalan: 2 500 000</i>`,
-            parse_mode: 'HTML',
-            reply_markup: { remove_keyboard: true }
-        });
-    }
-
-    if (data === 'refresh_balance') {
-        const firstName = cq.from ? cq.from.first_name : 'Foydalanuvchi';
-        await sendTelegramApi('answerCallbackQuery', {
-            callback_query_id: cq.id,
-            text: '🔄 Yangilanmoqda...',
-            show_alert: false
-        });
-        await sendBalanceSummary(chatId, firstName, user);
-    }
-}
-
-
-
-
-// ============================================================
-// DAILY REPORT
-// ============================================================
-async function sendDailyReport(chatId, firstName, user) {
-    const today = getTodayDate();
-    const todayExp = user.expenses.filter(e => e.dateKey === today);
-    const totalSum = todayExp.reduce((s, e) => s + e.amount, 0);
-
-    let items = '';
-    if (todayExp.length === 0) {
-        items = '\n<i>Bugun harajat kiritilmadi.</i>';
-    } else {
-        todayExp.forEach((e, i) => {
-            items += `\n${i+1}. ${escapeHtml(e.description)} — <b>${formatMoney(e.amount)}</b> <i>(${e.time})</i>`;
-        });
-    }
-
-    await sendTelegramApi('sendMessage', {
-        chat_id: chatId,
-        text: `📊 <b>KUNLIK HISOBOT</b>\n📅 <b>${getTodayStr()}</b>\n👤 <b>${escapeHtml(firstName)}</b>\n\n💸 <b>Jami: <code>${formatMoney(totalSum)}</code></b>\n\n📝 <b>Harajatlar:</b>${items}\n\n✨ <i>Ertangi kuningiz barakali bo'lsin!</i>`,
-        parse_mode: 'HTML',
-        reply_markup: MAIN_KEYBOARD
-    });
-}
-
-// ============================================================
-// TASK LIST (inline Bajarildi tugmasi bilan)
-// ============================================================
-async function sendTaskList(chatId, firstName, user) {
-    const tasks = user.tasks;
-    if (tasks.length === 0) {
-        await sendTelegramApi('sendMessage', {
-            chat_id: chatId,
-            text: `📋 <b>Vazifalar bo'sh.</b>\n\nYangi vazifa qo'shish uchun <b>✅ Vazifa Qo'shish</b> tugmasini bosing.`,
-            parse_mode: 'HTML',
-            reply_markup: MAIN_KEYBOARD
-        });
+        await ack("🗑 O'chirildi");
+        await tgReq('deleteMessage', { chat_id: chatId, message_id: cq.message.message_id });
         return;
     }
 
-    const pending = tasks.filter(t => !t.completed);
-    const done = tasks.filter(t => t.completed);
-
-    let txt = `📋 <b>VAZIFALAR RO'YXATI</b>\n📅 ${getTodayStr()}\n\n`;
-    if (pending.length) {
-        txt += '⏳ <b>Kutilmoqda:</b>\n';
-        for (const t of pending) {
-            txt += `• ${t.emoji} ${escapeHtml(t.title)}\n`;
-        }
-    }
-    if (done.length) {
-        txt += '\n✅ <b>Bajarildi:</b>\n';
-        for (const t of done) {
-            txt += `• ✔️ <s>${escapeHtml(t.title)}</s>\n`;
-        }
-    }
-    txt += `\n<i>Jami: ${tasks.length} | ✅ ${done.length} | ⏳ ${pending.length}</i>`;
-
-    // Har bir pending vazifaga inline tugma
-    const inlineButtons = pending.slice(0, 8).map(t => ([
-        { text: `✅ ${t.title.substring(0, 25)}`, callback_data: `done_task_${t.id}` }
-    ]));
-
-    await sendTelegramApi('sendMessage', {
-        chat_id: chatId,
-        text: txt,
-        parse_mode: 'HTML',
-        reply_markup: inlineButtons.length > 0
-            ? { inline_keyboard: inlineButtons }
-            : { remove_keyboard: true }
-    });
-}
-
-// ============================================================
-// STATISTICS — Davr bo'yicha
-// ============================================================
-async function sendStatistics(chatId, firstName, user, period = 'today') {
-    const expenses = user.expenses;
-
-    if (expenses.length === 0) {
-        await sendTelegramApi('sendMessage', {
-            chat_id: chatId,
-            text: `📈 <b>Statistika</b>\n\n<i>Hali harajat kiritilmagan.</i>`,
-            parse_mode: 'HTML',
-            reply_markup: MAIN_KEYBOARD
-        });
+    // Balans
+    if (data === 'balance_refresh') {
+        await ack('🔄 Yangilanmoqda...');
+        await showBalance(chatId, name, u);
         return;
     }
-
-    const now = new Date();
-    let filtered = [];
-    let periodLabel = '';
-
-    if (period === 'today') {
-        const today = getTodayDate();
-        filtered = expenses.filter(e => e.dateKey === today);
-        periodLabel = '🕐 Bugungi';
-    } else if (period === 'week') {
-        const weekAgo = new Date(now);
-        weekAgo.setDate(weekAgo.getDate() - 7);
-        filtered = expenses.filter(e => new Date(e.dateKey) >= weekAgo);
-        periodLabel = '📅 Haftalik (oxirgi 7 kun)';
-    } else if (period === 'month') {
-        const monthAgo = new Date(now);
-        monthAgo.setDate(1); // Shu oyning 1-kuni
-        const monthKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-        filtered = expenses.filter(e => e.dateKey && e.dateKey.startsWith(monthKey));
-        periodLabel = `🗓 Oylik (${now.toLocaleDateString('uz-UZ', {month:'long', year:'numeric'})})`;
-    } else if (period === 'year') {
-        const yearStr = String(now.getFullYear());
-        filtered = expenses.filter(e => e.dateKey && e.dateKey.startsWith(yearStr));
-        periodLabel = `📆 Yillik (${now.getFullYear()})`;
-    }
-
-    if (filtered.length === 0) {
-        await sendTelegramApi('sendMessage', {
-            chat_id: chatId,
-            text: `📈 <b>${periodLabel}</b>\n\n<i>Bu davr uchun harajat topilmadi.</i>`,
-            parse_mode: 'HTML',
-            reply_markup: MAIN_KEYBOARD
-        });
+    if (data === 'income_start') {
+        await ack();
+        u.state = 'inc_amount'; u.pending = {};
+        await save();
+        await send(chatId, `💵 <b>Kirim Qo\'shish</b>\n\nNecha so\'m?\n<i>Masalan: 2 500 000</i>`, { reply_markup: { remove_keyboard: true } });
         return;
     }
-
-    const totalSum = filtered.reduce((s, e) => s + e.amount, 0);
-    const totalCount = filtered.length;
-
-    // Kunlik o'rtacha
-    const uniqueDays = new Set(filtered.map(e => e.dateKey)).size;
-    const avgDaily = uniqueDays > 0 ? Math.round(totalSum / uniqueDays) : totalSum;
-
-    // Toifa bo'yicha
-    const catMap = {};
-    filtered.forEach(e => {
-        const key = e.description || 'Boshqa';
-        catMap[key] = (catMap[key] || 0) + e.amount;
-    });
-    const topCats = Object.entries(catMap).sort((a,b) => b[1]-a[1]).slice(0, 5);
-    let catText = '';
-    topCats.forEach(([desc, sum], i) => {
-        const percent = Math.round((sum / totalSum) * 100);
-        const bar = '█'.repeat(Math.round(percent/10)) + '░'.repeat(10 - Math.round(percent/10));
-        catText += `\n${i+1}. ${escapeHtml(desc)}\n   ${bar} ${percent}%  <b>${formatMoney(sum)}</b>\n`;
-    });
-
-    // Eng ko'p harajat qilingan kun
-    const dayMap = {};
-    filtered.forEach(e => {
-        dayMap[e.dateKey] = (dayMap[e.dateKey] || 0) + e.amount;
-    });
-    const topDay = Object.entries(dayMap).sort((a,b)=>b[1]-a[1])[0];
-    const topDayText = topDay
-        ? `📅 <b>Eng yuqori kun:</b> ${topDay[0]} — <code>${formatMoney(topDay[1])}</code>`
-        : '';
-
-    await sendTelegramApi('sendMessage', {
-        chat_id: chatId,
-        text: `📈 <b>STATISTIKA — ${periodLabel}</b>\n👤 <b>${escapeHtml(firstName)}</b>\n\n💰 <b>Jami harajat:</b> <code>${formatMoney(totalSum)}</code>\n📊 <b>Jami bitim:</b> ${totalCount} ta\n📆 <b>Kun soni:</b> ${uniqueDays} kun\n📉 <b>Kunlik o'rtacha:</b> <code>${formatMoney(avgDaily)}</code>\n${topDayText}\n\n🏆 <b>Toifalar bo'yicha:</b>\n${catText}`,
-        parse_mode: 'HTML',
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: '🕐 Bugungi', callback_data: 'stat_today' },
-                    { text: '📅 Haftalik', callback_data: 'stat_week' }
-                ],
-                [
-                    { text: '🗓 Oylik', callback_data: 'stat_month' },
-                    { text: '📆 Yillik', callback_data: 'stat_year' }
-                ]
-            ]
-        }
-    });
 }
-
