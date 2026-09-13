@@ -104,11 +104,13 @@ const KB_MAIN = {
     keyboard: [
         ['💸 Harajat Qo\'shish', '✅ Vazifa Qo\'shish'],
         ['📊 Kunlik Hisobot',    '📋 Vazifalar Ro\'yxati'],
-        ['💰 Balans',            '📈 Statistika']
+        ['💰 Balans',            '📈 Statistika'],
+        ['🗂 Harajatlar Tarixi']
     ],
     resize_keyboard: true,
     persistent: true
 };
+
 const KB_REMOVE = { remove_keyboard: true };
 
 const KB_CATEGORY = {
@@ -149,6 +151,7 @@ const MENU_TEXTS = new Set([
     '💸 Harajat Qo\'shish','✅ Vazifa Qo\'shish',
     '📊 Kunlik Hisobot','📋 Vazifalar Ro\'yxati',
     '💰 Balans','📈 Statistika',
+    '🗂 Harajatlar Tarixi',
     '🍽 Taom/Oziq-ovqat','🚕 Transport','🛍 Xarid',
     '💊 Sog\'liq','💡 Kommunal','🎬 O\'yin-kulgi','📦 Boshqa',
     '🔴 Juda Zarur','🟡 Muhim','🟢 Oddiy',
@@ -158,6 +161,7 @@ const MENU_TEXTS = new Set([
     '💼 Oylik maosh','🎁 Bonus','🛒 Savdo daromadi','📦 Boshqa kirim',
     '💵 Kirim Qo\'shish'
 ]);
+
 
 // ─── AUTH PROMPT ──────────────────────────────────────────────
 async function askCode(chatId, isNewDay = false) {
@@ -258,10 +262,6 @@ async function showDailyReport(chatId, name, u) {
     const allExp= (u.expenses||[]).reduce((s,e)=>s+e.amount,0);
     const rem   = inc - allExp;
 
-    let items = list.length
-        ? list.map((e,i)=>`${i+1}. ${esc(e.description)} — <b>${money(e.amount)}</b> <i>(${e.time})</i>`).join('\n')
-        : '<i>Bugun harajat kiritilmadi.</i>';
-
     let balLine = '';
     if (inc > 0) {
         balLine = rem >= 0
@@ -269,13 +269,89 @@ async function showDailyReport(chatId, name, u) {
             : `\n━━━━━━━━━━━━━━━━\n⚠️ <b>Balans:</b> <code>-${money(Math.abs(rem))}</code>`;
     }
 
+    if (list.length === 0) {
+        await send(chatId,
+            `📊 <b>KUNLIK HISOBOT</b>\n📅 <b>${dateStr()}</b>  •  ${esc(name)}\n\n<i>Bugun harajat kiritilmadi.</i>${balLine}`,
+            { reply_markup: KB_MAIN }
+        );
+        return;
+    }
+
+    // Sarlavha xabar
     await send(chatId,
         `📊 <b>KUNLIK HISOBOT</b>\n📅 <b>${dateStr()}</b>  •  ${esc(name)}\n\n` +
-        `💸 <b>Jami:</b> <code>${money(total)}</code>\n\n` +
-        `📝 <b>Harajatlar:</b>\n${items}${balLine}`,
+        `💸 <b>Jami:</b> <code>${money(total)}</code>  •  <b>${list.length} ta harajat</b>\n\n` +
+        `<i>Har bir harajat yonidagi 🗑 tugma bilan o'chirishingiz mumkin:</i>${balLine}`,
         { reply_markup: KB_MAIN }
     );
+
+    // Har bir harajatni alohida inline tugma bilan
+    for (const e of list) {
+        await send(chatId,
+            `${e.time ? `🕐 <b>${e.time}</b>  ` : ''}💵 <b>${money(e.amount)}</b>\n📝 ${esc(e.description)}`,
+            {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: `🗑 O'chirish`, callback_data: `del_exp_${e.id}` },
+                        { text: `✏️ Tahrirlash`, callback_data: `edit_exp_${e.id}` }
+                    ]]
+                }
+            }
+        );
+    }
 }
+
+// ─── HARAJATLAR TARIXI ────────────────────────────────────────
+async function showExpenseHistory(chatId, name, u) {
+    const all = [...(u.expenses||[])].reverse(); // yangi → eski
+    if (all.length === 0) {
+        await send(chatId, `📋 <b>Harajatlar tarixi bo'sh.</b>`, { reply_markup: KB_MAIN });
+        return;
+    }
+
+    // Kunlar bo'yicha guruhlash
+    const byDay = {};
+    all.forEach(e => {
+        const k = e.dateKey || e.date || 'nodate';
+        if (!byDay[k]) byDay[k] = [];
+        byDay[k].push(e);
+    });
+
+    const days = Object.keys(byDay).sort().reverse().slice(0, 7); // So'nggi 7 kun
+    const totalAll = all.reduce((s,e)=>s+e.amount,0);
+
+    await send(chatId,
+        `📋 <b>HARAJATLAR TARIXI</b>  •  ${esc(name)}\n` +
+        `🔢 Jami: <code>${money(totalAll)}</code>  •  ${all.length} ta\n\n` +
+        `<i>So'nggi 7 kunni ko'rsatmoqda. O'chirish uchun 🗑 bosing:</i>`
+    );
+
+    for (const day of days) {
+        const dayList = byDay[day];
+        const dayTotal = dayList.reduce((s,e)=>s+e.amount,0);
+        const dateLabel = day === today() ? '📅 Bugun' : `📅 ${day}`;
+
+        // Kun sarlavhasi
+        await send(chatId, `${dateLabel}  —  <b>${money(dayTotal)}</b>`);
+
+        // Har bir harajat
+        for (const e of dayList) {
+            await send(chatId,
+                `${e.time ? `🕐 ${e.time}  ` : ''}💵 <b>${money(e.amount)}</b>  📝 ${esc(e.description)}`,
+                {
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: `🗑 O'chirish`, callback_data: `del_exp_${e.id}` },
+                            { text: `✏️ Tahrirlash`, callback_data: `edit_exp_${e.id}` }
+                        ]]
+                    }
+                }
+            );
+        }
+    }
+}
+
+
 
 // ─── STATISTICS ───────────────────────────────────────────────
 async function showStats(chatId, name, u, period) {
@@ -562,7 +638,14 @@ module.exports = async (req, res) => {
             return;
         }
 
+        if (text === '🗂 Harajatlar Tarixi' || text === '/tarix') {
+            u.state = null; await save();
+            await showExpenseHistory(chatId, name, u);
+            return;
+        }
+
         // ── STATE MACHINE ─────────────────────────────────────
+
 
         // HARAJAT: summa
         if (u.state === 'exp_amount' || u.state === 'exp_amount_voice') {
@@ -796,12 +879,49 @@ async function handleCallback(cq) {
     // Harajat o'chirish
     if (data.startsWith('del_exp_')) {
         const id = data.slice(8);
+        const exp = (u.expenses||[]).find(e=>e.id===id);
         u.expenses = (u.expenses||[]).filter(e=>e.id!==id);
         await save();
-        await ack("🗑 O'chirildi");
-        await tgReq('deleteMessage', { chat_id: chatId, message_id: cq.message.message_id });
+        await ack("🗑 Harajat o'chirildi!");
+        // Xabarni o'chirish
+        try { await tgReq('deleteMessage', { chat_id: chatId, message_id: cq.message.message_id }); } catch(_){}
+        // Yangi balans ko'rsat
+        if (exp) {
+            const totalInc = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
+            const totalExp = (u.expenses||[]).reduce((s,e)=>s+e.amount,0);
+            const rem = totalInc - totalExp;
+            let balLine = totalInc > 0
+                ? (rem >= 0 ? `\n✅ <b>Yangi balans:</b> <code>${money(rem)}</code>` : `\n⚠️ <b>Yangi balans:</b> <code>-${money(Math.abs(rem))}</code>`)
+                : '';
+            await send(chatId,
+                `🗑 <b>O'chirildi:</b> ${esc(exp.description)} — <code>${money(exp.amount)}</code>${balLine}`
+            );
+        }
         return;
     }
+
+    // Harajat tahrirlash (o'chir + qayta kiritish so'ra)
+    if (data.startsWith('edit_exp_')) {
+        const id = data.slice(9);
+        const exp = (u.expenses||[]).find(e=>e.id===id);
+        if (!exp) { await ack('Topilmadi'); return; }
+        // Eski harajatni o'chir
+        u.expenses = (u.expenses||[]).filter(e=>e.id!==id);
+        // Yangi harajat kiritish holatiga o't
+        u.state = 'exp_amount';
+        u.pending = {};
+        await save();
+        await ack('✏️ Tahrirlash...');
+        try { await tgReq('deleteMessage', { chat_id: chatId, message_id: cq.message.message_id }); } catch(_){}
+        await send(chatId,
+            `✏️ <b>Tahrirlash</b>\n\n` +
+            `Eski: <s>${esc(exp.description)}</s> — <code>${money(exp.amount)}</code>\n\n` +
+            `Yangi summasini kiriting:`,
+            { reply_markup: { remove_keyboard: true } }
+        );
+        return;
+    }
+
 
     // Balans
     if (data === 'balance_refresh') {
