@@ -474,24 +474,32 @@ async function checkReminders(chatId, u) {
 //  MAIN WEBHOOK HANDLER
 // ════════════════════════════════════════════════════════════
 module.exports = async (req, res) => {
-    res.status(200).send('OK');   // Darhol 200 qaytarish
-    if (req.method !== 'POST') return;
+    if (req.method !== 'POST') {
+        return res.status(200).send('Telegram Bot Active v6.1');
+    }
 
-    // Owner chatId ni yuklash (cold start dan keyin)
-    if (!OWNER_CHAT_ID) await loadOwner();
+    try {
+        let upd = req.body;
+        if (typeof upd === 'string') { try { upd = JSON.parse(upd); } catch(_){} }
+        if (!upd) return res.status(200).send('OK');
 
-    let upd = req.body;
-    if (typeof upd === 'string') { try { upd = JSON.parse(upd); } catch(_){} }
-    if (!upd) return;
+        // Owner chatId ni yuklash (cold start dan keyin)
+        if (!OWNER_CHAT_ID) await loadOwner();
 
-    if (upd.callback_query) { await handleCallback(upd.callback_query); return; }
-    if (!upd.message) return;
+        if (upd.callback_query) {
+            await handleCallback(upd.callback_query);
+            return res.status(200).send('OK');
+        }
 
-    const msg    = upd.message;
-    const chatId = String(msg.chat.id);
-    const name   = msg.from?.first_name || 'Foydalanuvchi';
-    const u      = await getUser(chatId);
-    const save   = () => putUser(chatId, u);
+        if (!upd.message) return res.status(200).send('OK');
+
+        const msg    = upd.message;
+        const chatId = String(msg.chat.id);
+        const name   = msg.from?.first_name || 'Foydalanuvchi';
+        const u      = await getUser(chatId);
+        const save   = () => putUser(chatId, u);
+
+
 
     try {
         // ── OVOZLI XABAR ─────────────────────────────────────
@@ -795,8 +803,11 @@ module.exports = async (req, res) => {
     } catch (err) {
         console.error('[BOT ERROR]', err?.message || err);
         try { await send(chatId, `⚠️ Xato yuz berdi. /start yozing.`, { reply_markup: KB_MAIN }); } catch(_){}
+    } finally {
+        return res.status(200).send('OK');
     }
 };
+
 
 // ════════════════════════════════════════════════════════════
 //  CALLBACK QUERY HANDLER
