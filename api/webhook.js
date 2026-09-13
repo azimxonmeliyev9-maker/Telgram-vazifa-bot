@@ -1,5 +1,5 @@
 /**
- * VERCEL SERVERLESS WEBHOOK ENTRY-POINT (v6.0 ES Modules)
+ * VERCEL SERVERLESS WEBHOOK ENTRY-POINT (v6.2 ES Modules & Tashkent Timezone UTC+5)
  * Node.js 20.x, @vercel/kv, Subscription Guard & Payment System
  */
 import { CONFIG } from '../config.js';
@@ -10,7 +10,13 @@ import {
   deleteMessage,
   escapeHtml,
   formatMoney,
-  formatDate
+  formatDate,
+  getTashkentToday,
+  getTashkentDateStr,
+  getTashkentTimeStr,
+  getTashkentNowMinutes,
+  getTashkentMonthKey,
+  getTashkentYearKey
 } from '../lib/telegram.js';
 import { checkAccess } from '../lib/subscriptionGuard.js';
 import {
@@ -66,15 +72,6 @@ async function saveUserData(userId, data) {
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────
-function today() {
-  return new Date().toISOString().slice(0, 10);
-}
-function dateStr() {
-  return new Date().toLocaleDateString('uz-UZ', { year: 'numeric', month: 'long', day: 'numeric' });
-}
-function timeStr() {
-  return new Date().toLocaleTimeString('uz-UZ', { hour: '2-digit', minute: '2-digit' });
-}
 function parseNum(s) {
   if (!s) return null;
   let str = String(s).replace(/\s/g, '').replace(/,/g, '').replace(/_/g, '');
@@ -82,9 +79,11 @@ function parseNum(s) {
   const n = parseFloat(str);
   return isFinite(n) && n > 0 ? n : null;
 }
+
 function isNumericText(s) {
   return /^\d[\d\s,._k]*$/i.test(s.trim());
 }
+
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
 }
@@ -153,8 +152,7 @@ async function showBalanceView(chatId, name, u) {
     return;
   }
 
-  const now = new Date();
-  const mk = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const mk = getTashkentMonthKey();
   const mExp = (u.expenses || []).filter(e => (e.dateKey || '').startsWith(mk)).reduce((s, e) => s + e.amount, 0);
   const mInc = (u.incomes || []).filter(i => (i.dateKey || '').startsWith(mk)).reduce((s, i) => s + i.amount, 0);
   const mPct = mInc > 0 ? Math.round(mExp / mInc * 100) : (inc > 0 ? Math.round(mExp / inc * 100) : 0);
@@ -185,7 +183,7 @@ async function showBalanceView(chatId, name, u) {
 }
 
 async function showDailyReportView(chatId, name, u) {
-  const td = today();
+  const td = getTashkentToday();
   const list = (u.expenses || []).filter(e => e.dateKey === td);
   const total = list.reduce((s, e) => s + e.amount, 0);
   const inc = (u.incomes || []).reduce((s, i) => s + i.amount, 0);
@@ -201,14 +199,14 @@ async function showDailyReportView(chatId, name, u) {
 
   if (list.length === 0) {
     await sendMessage(chatId,
-      `📊 <b>KUNLIK HISOBOT</b>\n📅 ${dateStr()} • ${escapeHtml(name)}\n\n<i>Bugun harajat yo'q.</i>${balLine}`,
+      `📊 <b>KUNLIK HISOBOT</b>\n📅 ${getTashkentDateStr()} • ${escapeHtml(name)}\n\n<i>Bugun harajat yo'q.</i>${balLine}`,
       { reply_markup: KB_MAIN }
     );
     return;
   }
 
   await sendMessage(chatId,
-    `📊 <b>KUNLIK HISOBOT</b>\n📅 ${dateStr()} • ${escapeHtml(name)}\n\n` +
+    `📊 <b>KUNLIK HISOBOT</b>\n📅 ${getTashkentDateStr()} • ${escapeHtml(name)}\n\n` +
     `💸 <b>Jami:</b> <code>${formatMoney(total)}</code> • ${list.length} ta harajat${balLine}\n\n` +
     `<i>Quyidagi harajatlarni o'chirish yoki tahrirlash mumkin 👇</i>`,
     { reply_markup: KB_MAIN }
@@ -253,7 +251,7 @@ async function showExpenseHistoryView(chatId, name, u) {
   for (const day of days) {
     const dayList = byDay[day];
     const dayTotal = dayList.reduce((s, e) => s + e.amount, 0);
-    const lbl = day === today() ? '📅 Bugun' : `📅 ${day}`;
+    const lbl = day === getTashkentToday() ? '📅 Bugun' : `📅 ${day}`;
     await sendMessage(chatId, `${lbl} ━━━ <b>${formatMoney(dayTotal)}</b>`);
 
     for (const e of dayList) {
@@ -304,22 +302,24 @@ async function showTasksView(chatId, name, u) {
 }
 
 async function showStatsView(chatId, name, u, period) {
-  const now = new Date();
   let filtered, label;
+  const todayStr = getTashkentToday();
 
   if (period === 'today') {
-    filtered = (u.expenses || []).filter(e => e.dateKey === today());
+    filtered = (u.expenses || []).filter(e => e.dateKey === todayStr);
     label = '🕐 Bugungi';
   } else if (period === 'week') {
-    const from = new Date(now); from.setDate(from.getDate() - 7);
-    filtered = (u.expenses || []).filter(e => e.dateKey && new Date(e.dateKey) >= from);
+    const fromDate = new Date();
+    fromDate.setDate(fromDate.getDate() - 7);
+    const fromStr = getTashkentToday(fromDate);
+    filtered = (u.expenses || []).filter(e => e.dateKey && e.dateKey >= fromStr);
     label = '📅 Haftalik (7 kun)';
   } else if (period === 'month') {
-    const mk = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const mk = getTashkentMonthKey();
     filtered = (u.expenses || []).filter(e => (e.dateKey || '').startsWith(mk));
-    label = `🗓 ${now.toLocaleDateString('uz-UZ', { month: 'long', year: 'numeric' })}`;
+    label = `🗓 ${getTashkentDateStr()}`;
   } else {
-    const yr = String(now.getFullYear());
+    const yr = getTashkentYearKey();
     filtered = (u.expenses || []).filter(e => (e.dateKey || '').startsWith(yr));
     label = `📆 Yillik (${yr})`;
   }
@@ -366,9 +366,8 @@ async function showStatsView(chatId, name, u, period) {
 }
 
 async function checkReminders(chatId, u) {
-  const now = new Date();
-  const nm = now.getHours() * 60 + now.getMinutes();
-  const td = today();
+  const nm = getTashkentNowMinutes();
+  const td = getTashkentToday();
   let changed = false;
 
   for (const t of (u.tasks || [])) {
@@ -400,7 +399,7 @@ async function checkReminders(chatId, u) {
 // ════════════════════════════════════════════════════════════
 export default async function webhookHandler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(200).send('Telegram Bot Webhook Active v6.0');
+    return res.status(200).send('Telegram Bot Webhook Active v6.2 (Asia/Tashkent UTC+5)');
   }
 
   try {
@@ -716,11 +715,11 @@ export default async function webhookHandler(req, res) {
     if (u.state === 'exp_desc') {
       const amount = u.pending?.amount;
       if (amount && text) {
-        u.expenses.push({ id: genId(), amount, description: text, date: dateStr(), dateKey: today(), time: timeStr() });
+        u.expenses.push({ id: genId(), amount, description: text, date: getTashkentDateStr(), dateKey: getTashkentToday(), time: getTashkentTimeStr() });
         u.pending = {}; u.state = null;
         await save();
 
-        const todayExp = u.expenses.filter(e => e.dateKey === today()).reduce((s, e) => s + e.amount, 0);
+        const todayExp = u.expenses.filter(e => e.dateKey === getTashkentToday()).reduce((s, e) => s + e.amount, 0);
         const totalInc = (u.incomes || []).reduce((s, i) => s + i.amount, 0);
         const totalExp = u.expenses.reduce((s, e) => s + e.amount, 0);
         const rem = totalInc - totalExp;
@@ -731,7 +730,7 @@ export default async function webhookHandler(req, res) {
           : '';
 
         await sendMessage(chatId,
-          `✅ <b>Harajat saqlandi!</b>\n\n💵 ${formatMoney(amount)} • 📝 ${escapeHtml(text)} • 🕐 ${timeStr()}\n\n` +
+          `✅ <b>Harajat saqlandi!</b>\n\n💵 ${formatMoney(amount)} • 📝 ${escapeHtml(text)} • 🕐 ${getTashkentTimeStr()}\n\n` +
           `📊 Bugungi jami: <code>${formatMoney(todayExp)}</code>${balLine}`,
           { reply_markup: KB_MAIN }
         );
@@ -761,7 +760,7 @@ export default async function webhookHandler(req, res) {
       const amount = u.pending?.amount;
       if (amount && text) {
         if (!u.incomes) u.incomes = [];
-        u.incomes.push({ id: genId(), amount, description: text, date: dateStr(), dateKey: today(), time: timeStr() });
+        u.incomes.push({ id: genId(), amount, description: text, date: getTashkentDateStr(), dateKey: getTashkentToday(), time: getTashkentTimeStr() });
         u.pending = {}; u.state = null;
         await save();
 
@@ -821,7 +820,7 @@ export default async function webhookHandler(req, res) {
 
       const task = {
         id: genId(), title: title || 'Vazifa', priority: pr?.priority || 'medium', emoji, label,
-        date: dateStr(), dateKey: today(), time: timeStr(),
+        date: getTashkentDateStr(), dateKey: getTashkentToday(), time: getTashkentTimeStr(),
         deadlineTime, deadlineMinutes, reminderMinutes,
         reminderSent: false, deadlineSent: false, completed: false
       };
