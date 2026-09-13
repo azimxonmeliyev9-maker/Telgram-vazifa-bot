@@ -1,45 +1,59 @@
 /**
- * ╔═══════════════════════════════════════════════════════╗
- * ║   XARAJAT & VAZIFA BOT  —  v5.0 Professional         ║
- * ║   Azimjon uchun shaxsiy moliyaviy boshqaruv boti      ║
- * ╚═══════════════════════════════════════════════════════╝
- *
- *  ✅ v5.0 Yangiliklar:
- *   • Serverless-safe auth: har request KV dan yuklanadi
- *   • Raqam yozilganda "Kod noto'g'ri" CHIQMAYDI
- *   • Balans tizimi: kirim → harajat → qoldiq
- *   • Vazifa: sarlavha → muhimlik → soat → eslatma
- *   • Statistika: bugungi / haftalik / oylik / yillik
- *   • Kunlik hisobot: har kuni soat 20:00 da avtomatik
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║   XARAJAT & VAZIFA BOT  —  v6.0 Professional            ║
+ * ║   Azimjon uchun shaxsiy moliyaviy boshqaruv boti         ║
+ * ╠══════════════════════════════════════════════════════════╣
+ * ║  v6.0 Yangiliklar:                                       ║
+ * ║  • Admin (egasi) uchun KOD SO'RALMAYDI                   ║
+ * ║  • Birinchi foydalanishda chatId avtomatik saqlanadi     ║
+ * ║  • Harajatlar tarixi — har harajatda O'chirish/Tahrirlash║
+ * ║  • Barcha state muammolari hal qilindi                   ║
+ * ║  • KV (Vercel) + global fallback                        ║
+ * ╚══════════════════════════════════════════════════════════╝
  */
-
 'use strict';
 const https = require('https');
 
-// ─── CONSTANTS ───────────────────────────────────────────────
+// ─── CONFIG ──────────────────────────────────────────────────
 const BOT_TOKEN   = '8699086796:AAEeqqySXI7fXkQmomMEskOWj_zeH9cnMDY';
 const SECRET_CODE = '0000';
 
-// ─── PERSISTENT STORE (Vercel KV → global fallback) ──────────
+// Admin chatId — birinchi marta muvaffaqiyatli kirish orqali avtomatik saqlanadi
+// Keyin bu foydalanuvchidan KOD SO'RALMAYDI
+let OWNER_CHAT_ID = null;   // runtime da to'ldiriladi
+
+// ─── STORAGE ─────────────────────────────────────────────────
 let _kv = null;
 try { _kv = require('@vercel/kv').kv; } catch (_) {}
 if (!global.__store) global.__store = {};
 
 async function dbGet(key) {
-    if (_kv) { try { return await _kv.get(key); } catch (_) {} }
+    if (_kv) { try { const v = await _kv.get(key); if (v !== null) return v; } catch (_) {} }
     return global.__store[key] ?? null;
 }
 async function dbSet(key, val) {
-    if (_kv) { try { await _kv.set(key, val); return; } catch (_) {} }
-    global.__store[key] = val;
+    if (_kv) { try { await _kv.set(key, val); } catch (_) {} }
+    global.__store[key] = val;  // har doim global ga ham saqlash (fast read)
+}
+
+// Owner chatId ni yuklash
+async function loadOwner() {
+    const id = await dbGet('owner_chat_id');
+    if (id) OWNER_CHAT_ID = id;
+}
+async function saveOwner(chatId) {
+    OWNER_CHAT_ID = chatId;
+    await dbSet('owner_chat_id', chatId);
 }
 
 // ─── USER MODEL ───────────────────────────────────────────────
 const DEFAULT_USER = () => ({
-    authDate     : null,   // 'YYYY-MM-DD' — bugun auth qilingan sana
+    isOwner      : false,
+    authDate     : null,
+    authExpiry   : null,   // ISO string — auth tugash sanasi
     wrongAttempts: 0,
-    state        : null,   // joriy dialog holati
-    pending      : {},     // vaqtinchalik ma'lumotlar
+    state        : null,
+    pending      : {},
     expenses     : [],
     incomes      : [],
     tasks        : []
@@ -55,13 +69,27 @@ async function putUser(chatId, u) {
     await dbSet(`u:${chatId}`, u);
 }
 
-// ─── AUTH ─────────────────────────────────────────────────────
+// ─── AUTH ────────────────────────────────────────────────────
 function today() { return new Date().toISOString().slice(0, 10); }
 
-function isAuth(u) { return u.authDate === today(); }
+function isAuth(u, chatId) {
+    // Owner — KOD SO'RALMAYDI
+    if (u.isOwner || (OWNER_CHAT_ID && String(chatId) === String(OWNER_CHAT_ID))) return true;
+    // authExpiry (30 kunlik sessiya)
+    if (u.authExpiry && new Date() < new Date(u.authExpiry)) return true;
+    // Eski authDate fallback
+    if (u.authDate === today()) return true;
+    return false;
+}
 
-// ─── HELPERS ──────────────────────────────────────────────────
-function money(n) { return new Intl.NumberFormat('uz-UZ').format(n) + ' UZS'; }
+function getAuthExpiry(days = 30) {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    return d.toISOString();
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────
+function money(n) { return new Intl.NumberFormat('uz-UZ').format(Math.round(n)) + ' UZS'; }
 function dateStr() {
     return new Date().toLocaleDateString('uz-UZ', { year:'numeric', month:'long', day:'numeric' });
 }
@@ -74,14 +102,18 @@ function esc(s) {
 }
 function parseNum(s) {
     if (!s) return null;
-    const n = parseFloat(String(s).replace(/[\s,_]/g, '').replace(/\s/g, ''));
+    // "27 000", "27,000", "27000", "27k" kabi formatlarni qabul qilish
+    let str = String(s).replace(/\s/g,'').replace(/,/g,'').replace(/_/g,'');
+    if (/^(\d+)k$/i.test(str)) str = str.replace(/k$/i,'000');
+    const n = parseFloat(str);
     return isFinite(n) && n > 0 ? n : null;
 }
-function isNumeric(s) { return /^\d[\d\s,._]*$/.test(s.trim()); }
+function isNumericText(s) { return /^\d[\d\s,._k]*$/i.test(s.trim()); }
+function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2,5); }
 
-// ─── TELEGRAM API ─────────────────────────────────────────────
+// ─── TELEGRAM API ────────────────────────────────────────────
 function tgReq(method, body) {
-    return new Promise((ok, fail) => {
+    return new Promise((resolve) => {
         const payload = JSON.stringify(body);
         const req = https.request({
             hostname: 'api.telegram.org',
@@ -90,16 +122,23 @@ function tgReq(method, body) {
             headers : { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
         }, res => {
             let d = ''; res.on('data', c => d += c);
-            res.on('end', () => ok(JSON.parse(d)));
+            res.on('end', () => { try { resolve(JSON.parse(d)); } catch(_){ resolve(null); } });
         });
-        req.on('error', fail);
+        req.on('error', () => resolve(null));
         req.write(payload); req.end();
     });
 }
 const send = (chatId, text, extra = {}) =>
     tgReq('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra });
 
-// ─── KEYBOARDS ────────────────────────────────────────────────
+async function tryDelete(chatId, msgId) {
+    try { await tgReq('deleteMessage', { chat_id: chatId, message_id: msgId }); } catch(_){}
+}
+async function tryEdit(chatId, msgId, text, extra = {}) {
+    try { await tgReq('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', ...extra }); } catch(_){}
+}
+
+// ─── KEYBOARDS ───────────────────────────────────────────────
 const KB_MAIN = {
     keyboard: [
         ['💸 Harajat Qo\'shish', '✅ Vazifa Qo\'shish'],
@@ -110,7 +149,6 @@ const KB_MAIN = {
     resize_keyboard: true,
     persistent: true
 };
-
 const KB_REMOVE = { remove_keyboard: true };
 
 const KB_CATEGORY = {
@@ -146,12 +184,11 @@ const KB_INCOME_CAT = {
     resize_keyboard: true, one_time_keyboard: true
 };
 
-// Barcha tugma textlari (auth bypass uchun)
+// Barcha tugma textlari — auth gate dan o'tkazish uchun
 const MENU_TEXTS = new Set([
     '💸 Harajat Qo\'shish','✅ Vazifa Qo\'shish',
     '📊 Kunlik Hisobot','📋 Vazifalar Ro\'yxati',
-    '💰 Balans','📈 Statistika',
-    '🗂 Harajatlar Tarixi',
+    '💰 Balans','📈 Statistika','🗂 Harajatlar Tarixi',
     '🍽 Taom/Oziq-ovqat','🚕 Transport','🛍 Xarid',
     '💊 Sog\'liq','💡 Kommunal','🎬 O\'yin-kulgi','📦 Boshqa',
     '🔴 Juda Zarur','🟡 Muhim','🟢 Oddiy',
@@ -159,49 +196,43 @@ const MENU_TEXTS = new Set([
     '⏰ 18:00','⏰ 20:00','⏰ 22:00',
     '📅 Vaqtsiz (eslatma yo\'q)',
     '💼 Oylik maosh','🎁 Bonus','🛒 Savdo daromadi','📦 Boshqa kirim',
-    '💵 Kirim Qo\'shish'
+    '💵 Kirim Qo\'shish','🔙 Orqaga'
 ]);
 
-
-// ─── AUTH PROMPT ──────────────────────────────────────────────
-async function askCode(chatId, isNewDay = false) {
-    const txt = isNewDay
-        ? `🌅 <b>Yangi kun boshlandi!</b>\n\n🔐 Kunlik kodni kiriting:`
-        : `🔐 <b>Salom!</b>\n\nBu bot himoyalangan.\nKodingizni kiriting:`;
-    await send(chatId, txt, { reply_markup: KB_REMOVE });
+// ─── AUTH PROMPT ─────────────────────────────────────────────
+async function askCode(chatId) {
+    await send(chatId,
+        `🔐 <b>Tasdiqlash kerak</b>\n\nKodingizni kiriting:`,
+        { reply_markup: KB_REMOVE }
+    );
 }
 
-// ─── BALANCE SUMMARY ─────────────────────────────────────────
+// ─── BALANCE ─────────────────────────────────────────────────
 async function showBalance(chatId, name, u) {
-    const inc = (u.incomes || []).reduce((s, i) => s + i.amount, 0);
-    const exp = (u.expenses || []).reduce((s, e) => s + e.amount, 0);
+    const inc = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
+    const exp = (u.expenses||[]).reduce((s,e)=>s+e.amount,0);
     const rem = inc - exp;
 
     if (inc === 0) {
         await send(chatId,
             `💰 <b>Balansingiz</b>\n\n<i>Hali kirim qo'shilmagan.</i>\n\nDaromadingizni qo'shing:`,
-            {
-                reply_markup: {
-                    keyboard: [['💵 Kirim Qo\'shish']], resize_keyboard: true
-                }
-            }
+            { reply_markup: { keyboard:[['💵 Kirim Qo\'shish']], resize_keyboard:true } }
         );
         return;
     }
 
-    const now = new Date();
-    const mk = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-    const mExp = (u.expenses||[]).filter(e => (e.dateKey||'').startsWith(mk)).reduce((s,e)=>s+e.amount,0);
-    const mInc = (u.incomes||[]).filter(i => (i.dateKey||'').startsWith(mk)).reduce((s,i)=>s+i.amount,0);
-    const mPct = mInc > 0 ? Math.round(mExp/mInc*100) : (inc > 0 ? Math.round(mExp/inc*100) : 0);
+    const now  = new Date();
+    const mk   = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    const mExp = (u.expenses||[]).filter(e=>(e.dateKey||'').startsWith(mk)).reduce((s,e)=>s+e.amount,0);
+    const mInc = (u.incomes||[]).filter(i=>(i.dateKey||'').startsWith(mk)).reduce((s,i)=>s+i.amount,0);
+    const mPct = mInc>0 ? Math.round(mExp/mInc*100) : (inc>0 ? Math.round(mExp/inc*100) : 0);
 
     const remLine = rem >= 0
         ? `✅ <b>Qolgan:</b> <code>${money(rem)}</code>`
-        : `⚠️ <b>Qolgan:</b> <code>-${money(Math.abs(rem))}</code> (ortiqcha!)`;
+        : `⚠️ <b>Qolgan:</b> <code>-${money(Math.abs(rem))}</code> <i>(limit oshdi!)</i>`;
 
-    const last = (u.incomes||[]).slice(-3).reverse().map(i =>
-        `• <i>${esc(i.description)}</i> — <b>${money(i.amount)}</b>`
-    ).join('\n') || '<i>Yo\'q</i>';
+    const last = (u.incomes||[]).slice(-3).reverse()
+        .map(i=>`• <i>${esc(i.description)}</i> — <b>${money(i.amount)}</b>`).join('\n') || '<i>Yo\'q</i>';
 
     await send(chatId,
         `💰 <b>BALANSINGIZ</b>  —  ${esc(name)}\n\n` +
@@ -213,54 +244,22 @@ async function showBalance(chatId, name, u) {
         {
             reply_markup: {
                 inline_keyboard: [[
-                    { text: '➕ Kirim Qo\'shish', callback_data: 'income_start' },
-                    { text: '🔄 Yangilash',       callback_data: 'balance_refresh' }
+                    { text:'➕ Kirim Qo\'shish', callback_data:'income_start' },
+                    { text:'🔄 Yangilash',       callback_data:'balance_refresh' }
                 ]]
             }
         }
     );
 }
 
-// ─── TASK LIST ────────────────────────────────────────────────
-async function showTasks(chatId, name, u) {
-    const tasks = u.tasks || [];
-    if (tasks.length === 0) {
-        await send(chatId,
-            `📋 <b>Vazifalar bo\'sh.</b>\n\nYangi vazifa qo\'shish uchun ✅ Vazifa Qo\'shish tugmasini bosing.`,
-            { reply_markup: KB_MAIN }
-        );
-        return;
-    }
-    const pending = tasks.filter(t => !t.completed);
-    const done    = tasks.filter(t => t.completed);
-    let txt = `📋 <b>VAZIFALAR</b>  —  ${esc(name)}\n`;
-    if (pending.length) {
-        txt += `\n⏳ <b>Bajarilmagan (${pending.length}):</b>\n`;
-        pending.forEach(t => {
-            const dl = t.deadlineTime ? ` 🕐${t.deadlineTime}` : '';
-            txt += `• ${t.emoji} <b>${esc(t.title)}</b>${dl}\n`;
-        });
-    }
-    if (done.length) {
-        txt += `\n✅ <b>Bajarildi (${done.length}):</b>\n`;
-        done.slice(-5).forEach(t => { txt += `• ✔ <s>${esc(t.title)}</s>\n`; });
-    }
-    const buttons = pending.slice(0, 8).map(t => ([
-        { text: `✅ ${t.title.slice(0,28)}`, callback_data: `task_done_${t.id}` }
-    ]));
-    await send(chatId, txt, {
-        reply_markup: buttons.length ? { inline_keyboard: buttons } : { remove_keyboard: true }
-    });
-}
-
-// ─── DAILY REPORT ─────────────────────────────────────────────
+// ─── DAILY REPORT ────────────────────────────────────────────
 async function showDailyReport(chatId, name, u) {
-    const td = today();
-    const list = (u.expenses||[]).filter(e => e.dateKey === td);
-    const total = list.reduce((s,e)=>s+e.amount,0);
-    const inc   = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
-    const allExp= (u.expenses||[]).reduce((s,e)=>s+e.amount,0);
-    const rem   = inc - allExp;
+    const td   = today();
+    const list = (u.expenses||[]).filter(e=>e.dateKey===td);
+    const total= list.reduce((s,e)=>s+e.amount,0);
+    const inc  = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
+    const allExp=(u.expenses||[]).reduce((s,e)=>s+e.amount,0);
+    const rem  = inc - allExp;
 
     let balLine = '';
     if (inc > 0) {
@@ -271,121 +270,149 @@ async function showDailyReport(chatId, name, u) {
 
     if (list.length === 0) {
         await send(chatId,
-            `📊 <b>KUNLIK HISOBOT</b>\n📅 <b>${dateStr()}</b>  •  ${esc(name)}\n\n<i>Bugun harajat kiritilmadi.</i>${balLine}`,
+            `📊 <b>KUNLIK HISOBOT</b>\n📅 ${dateStr()}  •  ${esc(name)}\n\n<i>Bugun harajat yo'q.</i>${balLine}`,
             { reply_markup: KB_MAIN }
         );
         return;
     }
 
-    // Sarlavha xabar
+    // Sarlavha
     await send(chatId,
-        `📊 <b>KUNLIK HISOBOT</b>\n📅 <b>${dateStr()}</b>  •  ${esc(name)}\n\n` +
-        `💸 <b>Jami:</b> <code>${money(total)}</code>  •  <b>${list.length} ta harajat</b>\n\n` +
-        `<i>Har bir harajat yonidagi 🗑 tugma bilan o'chirishingiz mumkin:</i>${balLine}`,
+        `📊 <b>KUNLIK HISOBOT</b>\n📅 ${dateStr()}  •  ${esc(name)}\n\n` +
+        `💸 <b>Jami:</b> <code>${money(total)}</code>  •  ${list.length} ta harajat${balLine}\n\n` +
+        `<i>Quyidagi harajatlarni o'chirish yoki tahrirlash mumkin 👇</i>`,
         { reply_markup: KB_MAIN }
     );
 
-    // Har bir harajatni alohida inline tugma bilan
+    // Har bir harajat — alohida xabar + tugmalar
     for (const e of list) {
         await send(chatId,
-            `${e.time ? `🕐 <b>${e.time}</b>  ` : ''}💵 <b>${money(e.amount)}</b>\n📝 ${esc(e.description)}`,
+            `${e.time ? `🕐 <b>${e.time}</b>   ` : ''}💵 <b>${money(e.amount)}</b>\n📝 ${esc(e.description)}`,
             {
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: `🗑 O'chirish`, callback_data: `del_exp_${e.id}` },
-                        { text: `✏️ Tahrirlash`, callback_data: `edit_exp_${e.id}` }
-                    ]]
-                }
+                reply_markup: { inline_keyboard: [[
+                    { text:'🗑 O\'chirish',  callback_data:`del_${e.id}` },
+                    { text:'✏️ Tahrirlash', callback_data:`edit_${e.id}` }
+                ]]}
             }
         );
     }
 }
 
-// ─── HARAJATLAR TARIXI ────────────────────────────────────────
+// ─── EXPENSE HISTORY ─────────────────────────────────────────
 async function showExpenseHistory(chatId, name, u) {
-    const all = [...(u.expenses||[])].reverse(); // yangi → eski
+    const all = [...(u.expenses||[])].reverse();
     if (all.length === 0) {
-        await send(chatId, `📋 <b>Harajatlar tarixi bo'sh.</b>`, { reply_markup: KB_MAIN });
+        await send(chatId, `🗂 <b>Harajatlar tarixi bo'sh.</b>`, { reply_markup: KB_MAIN });
         return;
     }
 
-    // Kunlar bo'yicha guruhlash
     const byDay = {};
     all.forEach(e => {
-        const k = e.dateKey || e.date || 'nodate';
+        const k = e.dateKey || 'nodate';
         if (!byDay[k]) byDay[k] = [];
         byDay[k].push(e);
     });
 
-    const days = Object.keys(byDay).sort().reverse().slice(0, 7); // So'nggi 7 kun
+    const days = Object.keys(byDay).sort().reverse().slice(0, 10);
     const totalAll = all.reduce((s,e)=>s+e.amount,0);
 
     await send(chatId,
-        `📋 <b>HARAJATLAR TARIXI</b>  •  ${esc(name)}\n` +
-        `🔢 Jami: <code>${money(totalAll)}</code>  •  ${all.length} ta\n\n` +
-        `<i>So'nggi 7 kunni ko'rsatmoqda. O'chirish uchun 🗑 bosing:</i>`
+        `🗂 <b>HARAJATLAR TARIXI</b>\n👤 ${esc(name)}\n` +
+        `💰 Jami: <code>${money(totalAll)}</code>  •  ${all.length} ta\n\n` +
+        `<i>So'nggi 10 kunlik harajatlar (👇 har birini o'chirib yoki tahrirlashingiz mumkin):</i>`
     );
 
     for (const day of days) {
         const dayList = byDay[day];
         const dayTotal = dayList.reduce((s,e)=>s+e.amount,0);
-        const dateLabel = day === today() ? '📅 Bugun' : `📅 ${day}`;
+        const lbl = day === today() ? '📅 Bugun' : `📅 ${day}`;
+        await send(chatId, `${lbl}  ━━━  <b>${money(dayTotal)}</b>`);
 
-        // Kun sarlavhasi
-        await send(chatId, `${dateLabel}  —  <b>${money(dayTotal)}</b>`);
-
-        // Har bir harajat
         for (const e of dayList) {
             await send(chatId,
-                `${e.time ? `🕐 ${e.time}  ` : ''}💵 <b>${money(e.amount)}</b>  📝 ${esc(e.description)}`,
+                `${e.time ? `🕐 ${e.time}  ` : ''}💵 <b>${money(e.amount)}</b>   📝 ${esc(e.description)}`,
                 {
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: `🗑 O'chirish`, callback_data: `del_exp_${e.id}` },
-                            { text: `✏️ Tahrirlash`, callback_data: `edit_exp_${e.id}` }
-                        ]]
-                    }
+                    reply_markup: { inline_keyboard: [[
+                        { text:'🗑 O\'chirish',  callback_data:`del_${e.id}` },
+                        { text:'✏️ Tahrirlash', callback_data:`edit_${e.id}` }
+                    ]]}
                 }
             );
         }
     }
 }
 
+// ─── TASK LIST ───────────────────────────────────────────────
+async function showTasks(chatId, name, u) {
+    const tasks = u.tasks || [];
+    const pending = tasks.filter(t=>!t.completed);
+    const done    = tasks.filter(t=>t.completed);
 
+    if (tasks.length === 0) {
+        await send(chatId,
+            `📋 <b>Vazifalar bo'sh.</b>\n\nYangi vazifa qo'shish uchun ✅ Vazifa Qo'shish tugmasini bosing.`,
+            { reply_markup: KB_MAIN }
+        );
+        return;
+    }
 
-// ─── STATISTICS ───────────────────────────────────────────────
+    let txt = `📋 <b>VAZIFALAR</b>  —  ${esc(name)}\n`;
+    if (pending.length) {
+        txt += `\n⏳ <b>Bajarilmagan (${pending.length}):</b>\n`;
+        pending.forEach(t => {
+            txt += `• ${t.emoji} <b>${esc(t.title)}</b>${t.deadlineTime ? ` 🕐${t.deadlineTime}` : ''}\n`;
+        });
+    }
+    if (done.length) {
+        txt += `\n✅ <b>Bajarildi (${done.length}):</b>\n`;
+        done.slice(-5).forEach(t => { txt += `• ✔ <s>${esc(t.title)}</s>\n`; });
+    }
+
+    const buttons = pending.slice(0, 8).map(t=>[
+        { text:`✅ ${t.title.slice(0,28)}`, callback_data:`task_done_${t.id}` }
+    ]);
+    await send(chatId, txt, {
+        reply_markup: buttons.length ? { inline_keyboard: buttons } : KB_MAIN
+    });
+}
+
+// ─── STATISTICS ──────────────────────────────────────────────
 async function showStats(chatId, name, u, period) {
     const now = new Date();
     let filtered, label;
+
     if (period === 'today') {
-        filtered = (u.expenses||[]).filter(e => e.dateKey === today());
+        filtered = (u.expenses||[]).filter(e=>e.dateKey===today());
         label = '🕐 Bugungi';
     } else if (period === 'week') {
         const from = new Date(now); from.setDate(from.getDate()-7);
-        filtered = (u.expenses||[]).filter(e => e.dateKey && new Date(e.dateKey) >= from);
+        filtered = (u.expenses||[]).filter(e=>e.dateKey && new Date(e.dateKey)>=from);
         label = '📅 Haftalik (7 kun)';
     } else if (period === 'month') {
         const mk = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-        filtered = (u.expenses||[]).filter(e => (e.dateKey||'').startsWith(mk));
-        label = `🗓 Oylik (${now.toLocaleDateString('uz-UZ',{month:'long',year:'numeric'})})`;
+        filtered = (u.expenses||[]).filter(e=>(e.dateKey||'').startsWith(mk));
+        label = `🗓 ${now.toLocaleDateString('uz-UZ',{month:'long',year:'numeric'})}`;
     } else {
         const yr = String(now.getFullYear());
-        filtered = (u.expenses||[]).filter(e => (e.dateKey||'').startsWith(yr));
+        filtered = (u.expenses||[]).filter(e=>(e.dateKey||'').startsWith(yr));
         label = `📆 Yillik (${yr})`;
     }
+
     if (!filtered.length) {
         await send(chatId, `📈 <b>${label}</b>\n\n<i>Bu davr uchun harajat topilmadi.</i>`, { reply_markup: KB_MAIN });
         return;
     }
+
     const total = filtered.reduce((s,e)=>s+e.amount,0);
     const days  = new Set(filtered.map(e=>e.dateKey)).size;
-    const avg   = Math.round(total/days);
+    const avg   = Math.round(total/Math.max(days,1));
+
     const catMap = {};
     filtered.forEach(e=>{ catMap[e.description]=(catMap[e.description]||0)+e.amount; });
     const top = Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
-    let catTxt = top.map(([d,s],i)=>{
+    const catTxt = top.map(([d,s],i)=>{
         const pct = Math.round(s/total*100);
-        const bar = '█'.repeat(Math.round(pct/10))+'░'.repeat(10-Math.round(pct/10));
+        const bar = '█'.repeat(Math.max(1,Math.round(pct/10)))+'░'.repeat(Math.max(0,10-Math.round(pct/10)));
         return `${i+1}. ${esc(d)}\n   ${bar} ${pct}% — <b>${money(s)}</b>`;
     }).join('\n');
 
@@ -398,110 +425,79 @@ async function showStats(chatId, name, u, period) {
         `💰 <b>Jami:</b> <code>${money(total)}</code>\n` +
         `📊 <b>Bitimlar:</b> ${filtered.length} ta\n` +
         `📆 <b>Kunlar:</b> ${days}\n` +
-        `📉 <b>Kunlik o\'rtacha:</b> <code>${money(avg)}</code>\n` +
+        `📉 <b>O\'rtacha/kun:</b> <code>${money(avg)}</code>\n` +
         (topDay ? `🏆 <b>Eng yuqori kun:</b> ${topDay[0]} — <code>${money(topDay[1])}</code>\n` : '') +
         `\n🏅 <b>Toifalar:</b>\n${catTxt}`,
         {
             reply_markup: {
                 inline_keyboard: [
-                    [
-                        { text:'🕐 Bugungi',  callback_data:'stat_today' },
-                        { text:'📅 Haftalik', callback_data:'stat_week' }
-                    ],
-                    [
-                        { text:'🗓 Oylik',    callback_data:'stat_month' },
-                        { text:'📆 Yillik',   callback_data:'stat_year' }
-                    ]
+                    [{ text:'🕐 Bugungi',callback_data:'stat_today'},{text:'📅 Haftalik',callback_data:'stat_week'}],
+                    [{ text:'🗓 Oylik',callback_data:'stat_month'},{text:'📆 Yillik',callback_data:'stat_year'}]
                 ]
             }
         }
     );
 }
 
-// ─── REMINDER CHECK (har xabarda) ────────────────────────────
+// ─── REMINDER CHECK ──────────────────────────────────────────
 async function checkReminders(chatId, u) {
     const now = new Date();
     const nm  = now.getHours()*60 + now.getMinutes();
     const td  = today();
+    let changed = false;
+
     for (const t of (u.tasks||[])) {
         if (t.completed || !t.deadlineMinutes || t.dateKey !== td) continue;
         if (!t.reminderSent && t.reminderMinutes != null && nm >= t.reminderMinutes && nm < t.deadlineMinutes) {
-            t.reminderSent = true;
+            t.reminderSent = true; changed = true;
             await send(chatId,
-                `⏰ <b>ESLATMA!</b>\n\n📌 <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\n` +
-                `⏱ <b>${t.deadlineMinutes-nm} daqiqa</b> qoldi (<code>${t.deadlineTime}</code>)\n\nTez bajaring! 💪`,
-                { reply_markup: { inline_keyboard: [[{ text:'✅ Bajarildi!', callback_data:`task_done_${t.id}` }]] } }
+                `⏰ <b>ESLATMA!</b>\n📌 <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\n` +
+                `⏱ <b>${t.deadlineMinutes-nm} daqiqa</b> qoldi (🕐 <code>${t.deadlineTime}</code>)\nTez bajaring! 💪`,
+                { reply_markup: { inline_keyboard:[[{ text:'✅ Bajarildi!',callback_data:`task_done_${t.id}` }]] } }
             );
         }
         if (!t.deadlineSent && nm >= t.deadlineMinutes) {
-            t.deadlineSent = true;
+            t.deadlineSent = true; changed = true;
             await send(chatId,
-                `🔔 <b>MUDDAT TUGADI!</b>\n\n📌 <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\nBajardingizmi?`,
-                { reply_markup: { inline_keyboard: [[
-                    { text:'✅ Ha, bajardim!', callback_data:`task_done_${t.id}` },
-                    { text:'⏳ Hali yo\'q',    callback_data:`task_skip_${t.id}` }
+                `🔔 <b>MUDDAT TUGADI!</b>\n📌 <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\nBajardingizmi?`,
+                { reply_markup: { inline_keyboard:[[
+                    { text:'✅ Ha, bajardim!',callback_data:`task_done_${t.id}` },
+                    { text:'⏳ Hali yo\'q',   callback_data:`task_skip_${t.id}` }
                 ]]} }
             );
         }
     }
+    return changed;
 }
 
 // ════════════════════════════════════════════════════════════
 //  MAIN WEBHOOK HANDLER
 // ════════════════════════════════════════════════════════════
 module.exports = async (req, res) => {
-    res.status(200).send('OK');   // Telegram ga darhol 200 qaytarish
-
+    res.status(200).send('OK');   // Darhol 200 qaytarish
     if (req.method !== 'POST') return;
+
+    // Owner chatId ni yuklash (cold start dan keyin)
+    if (!OWNER_CHAT_ID) await loadOwner();
 
     let upd = req.body;
     if (typeof upd === 'string') { try { upd = JSON.parse(upd); } catch(_){} }
     if (!upd) return;
 
-    // ── Callback Query ────────────────────────────────────────
-    if (upd.callback_query) {
-        await handleCallback(upd.callback_query);
-        return;
-    }
-
-    // ── Yangi foydalanuvchi botni boshladi (START tugmasi) ────
-    if (upd.my_chat_member) {
-        const mc = upd.my_chat_member;
-        if (mc.new_chat_member?.status === 'member') {
-            const chatId = mc.chat.id;
-            const name = mc.from?.first_name || 'Foydalanuvchi';
-            const u = await getUser(chatId);
-            if (!isAuth(u)) {
-                await send(chatId,
-                    `👋 <b>Assalomu alaykum, ${esc(name)}!</b>\n\n` +
-                    `🌟 <b>Xarajat & Vazifa Boti</b>\n\n` +
-                    `Bu bot yordamida:\n` +
-                    `  💸 Harajatlaringizni kuzating\n` +
-                    `  ✅ Vazifalar belgilang\n` +
-                    `  💰 Balansingizni nazorat qiling\n\n` +
-                    `🔐 Botdan foydalanish uchun kodni kiriting:`,
-                    { reply_markup: { remove_keyboard: true } }
-                );
-            }
-        }
-        return;
-    }
-
+    if (upd.callback_query) { await handleCallback(upd.callback_query); return; }
     if (!upd.message) return;
 
-
-    const msg      = upd.message;
-    const chatId   = msg.chat.id;
-    const name     = (msg.from?.first_name) || 'Foydalanuvchi';
-    const u        = await getUser(chatId);
-    const save     = () => putUser(chatId, u);
+    const msg    = upd.message;
+    const chatId = String(msg.chat.id);
+    const name   = msg.from?.first_name || 'Foydalanuvchi';
+    const u      = await getUser(chatId);
+    const save   = () => putUser(chatId, u);
 
     try {
         // ── OVOZLI XABAR ─────────────────────────────────────
         if (msg.voice || msg.audio) {
-            if (!isAuth(u)) { await askCode(chatId); return; }
-            u.state = 'exp_amount_voice';
-            u.pending = {};
+            if (!isAuth(u, chatId)) { await askCode(chatId); return; }
+            u.state = 'exp_amount'; u.pending = { fromVoice: true };
             await save();
             await send(chatId,
                 `🎤 <b>Ovozli xabar qabul qilindi!</b> (${msg.voice?.duration||0} sek)\n\n💰 Harajat summasini yozing:`,
@@ -513,63 +509,55 @@ module.exports = async (req, res) => {
         const text = (msg.text||'').trim();
         if (!text) return;
 
-        // ── /start ────────────────────────────────────────────
+        // ── /start ───────────────────────────────────────────
         if (text === '/start' || text === '/menu') {
             u.state = null; u.pending = {};
             await save();
-            if (isAuth(u)) {
+            if (isAuth(u, chatId)) {
                 await send(chatId,
-                    `👋 <b>Xush kelibsiz, ${esc(name)}!</b>\n\n` +
-                    `💸 Harajat qo'shing\n` +
-                    `✅ Vazifa belgilang\n` +
-                    `💰 Balans ko'ring`,
+                    `👋 <b>Xush kelibsiz, ${esc(name)}!</b>\n\n💸 Harajat  •  ✅ Vazifa  •  💰 Balans`,
                     { reply_markup: KB_MAIN }
                 );
             } else {
                 await send(chatId,
-                    `👋 <b>Assalomu alaykum, ${esc(name)}!</b>\n\n` +
-                    `🌟 <b>Xarajat & Vazifa Boti</b>\n\n` +
-                    `  💸 Harajatlarni kuzating\n` +
-                    `  ✅ Vazifalar belgilang\n` +
-                    `  💰 Balansni nazorat qiling\n\n` +
-                    `🔐 Botdan foydalanish uchun kodni kiriting:`,
-                    { reply_markup: { remove_keyboard: true } }
+                    `👋 <b>Assalomu alaykum, ${esc(name)}!</b>\n\n🌟 <b>Xarajat & Vazifa Boti</b>\n\n` +
+                    `  💸 Harajatlarni kuzating\n  ✅ Vazifalar belgilang\n  💰 Balansni nazorat qiling\n\n` +
+                    `🔐 Kodni kiriting:`,
+                    { reply_markup: KB_REMOVE }
                 );
             }
             return;
         }
 
-        // ── AUTH GATE ─────────────────────────────────────────
-        if (!isAuth(u)) {
+        // ── AUTH GATE ────────────────────────────────────────
+        if (!isAuth(u, chatId)) {
             if (text === SECRET_CODE) {
-                // ✅ To'g'ri kod
-                u.authDate      = today();
+                // ✅ To'g'ri kod — owner sifatida saqlash
+                u.authDate    = today();
+                u.authExpiry  = getAuthExpiry(365); // 1 yil
+                u.isOwner     = true;
                 u.wrongAttempts = 0;
                 await save();
+                // Birinchi marta owner ni saqlash
+                if (!OWNER_CHAT_ID) await saveOwner(chatId);
+
                 await send(chatId,
                     `✅ <b>Xush kelibsiz, ${esc(name)}!</b> 🎉\n\n` +
                     `🌟 <b>Vazifalar & Harajatlar Boti</b>\n\n` +
-                    `📌 Bugun siz uchun:\n` +
-                    `  💸 Harajat qo\'shing\n` +
-                    `  ✅ Vazifa belgilang\n` +
-                    `  💰 Balans ko\'ring\n\n` +
-                    `<i>✅ Bugun yana kod so\'ralmaydi.</i>`,
+                    `  💸 Harajat qo'shing\n  ✅ Vazifa belgilang\n  💰 Balans ko'ring\n\n` +
+                    `<i>✅ Endi sizdan kod so'ralmaydi.</i>`,
                     { reply_markup: KB_MAIN }
                 );
-            } else if (MENU_TEXTS.has(text) || text.startsWith('/') || isNumeric(text)) {
-                // Tugma yoki raqam → "kod kiriting" (xato dema!)
-                const newDay = u.authDate && u.authDate !== today();
-                await askCode(chatId, newDay);
+            } else if (MENU_TEXTS.has(text) || text.startsWith('/') || isNumericText(text)) {
+                await askCode(chatId);
             } else {
-                // Haqiqiy noto'g'ri kod
                 u.wrongAttempts = (u.wrongAttempts||0) + 1;
                 await save();
                 if (u.wrongAttempts >= 5) {
-                    u.wrongAttempts = 0;
-                    await save();
-                    await send(chatId, `🚫 <b>Juda ko\'p noto\'g\'ri urinish!</b>\n\n/start yozib qayta urinib ko\'ring.`);
+                    u.wrongAttempts = 0; await save();
+                    await send(chatId, `🚫 <b>Juda ko\'p noto\'g\'ri urinish.</b>\n\n/start yozing.`);
                 } else {
-                    await send(chatId, `❌ <b>Kod noto\'g\'ri!</b>\n<i>Qolgan urinish: ${5-u.wrongAttempts} ta</i>`);
+                    await send(chatId, `❌ <b>Kod noto\'g\'ri</b>  (${5-u.wrongAttempts} urinish qoldi)`);
                 }
             }
             return;
@@ -577,8 +565,9 @@ module.exports = async (req, res) => {
 
         // ════ AUTENTIFIKATSIYA MUVAFFAQIYATLI ════════════════
 
-        // Har xabarda eslatmalarni tekshir
-        await checkReminders(chatId, u);
+        // Eslatmalarni tekshir (har xabarda)
+        const remChanged = await checkReminders(chatId, u);
+        if (remChanged) await save();
 
         // ── ASOSIY MENYU TUGMALARI ────────────────────────────
 
@@ -592,7 +581,7 @@ module.exports = async (req, res) => {
         if (text === '✅ Vazifa Qo\'shish') {
             u.state = 'task_title'; u.pending = {};
             await save();
-            await send(chatId, `✅ <b>Yangi Vazifa</b>\n\nVazifa nomini yozing:\n<i>Masalan: Hisobot tayyorlash</i>`, { reply_markup: KB_REMOVE });
+            await send(chatId, `✅ <b>Yangi Vazifa</b>\n\nVazifa nomini yozing:`, { reply_markup: KB_REMOVE });
             return;
         }
 
@@ -614,24 +603,13 @@ module.exports = async (req, res) => {
             return;
         }
 
-        if (text === '💵 Kirim Qo\'shish') {
-            u.state = 'inc_amount'; u.pending = {};
-            await save();
-            await send(chatId, `💵 <b>Kirim Qo\'shish</b>\n\nNecha so\'m qo\'shmoqchisiz?\n<i>Masalan: 2 500 000</i>`, { reply_markup: KB_REMOVE });
-            return;
-        }
-
         if (text === '📈 Statistika' || text === '/stat') {
             u.state = null; await save();
-            await send(chatId, `📈 <b>Statistika</b>\n\nQaysi davr uchun ko\'rmoqchisiz?`, {
+            await send(chatId, `📈 <b>Statistika</b>\n\nQaysi davr?`, {
                 reply_markup: {
                     inline_keyboard: [
-                        [
-                            { text:'📅 Haftalik', callback_data:'stat_week' },
-                            { text:'🗓 Oylik',    callback_data:'stat_month' },
-                            { text:'📆 Yillik',   callback_data:'stat_year' }
-                        ],
-                        [{ text:'🕐 Bugungi', callback_data:'stat_today' }]
+                        [{ text:'📅 Haftalik',callback_data:'stat_week'},{text:'🗓 Oylik',callback_data:'stat_month'},{text:'📆 Yillik',callback_data:'stat_year'}],
+                        [{ text:'🕐 Bugungi',callback_data:'stat_today'}]
                     ]
                 }
             });
@@ -644,11 +622,17 @@ module.exports = async (req, res) => {
             return;
         }
 
+        if (text === '💵 Kirim Qo\'shish') {
+            u.state = 'inc_amount'; u.pending = {};
+            await save();
+            await send(chatId, `💵 <b>Kirim Qo\'shish</b>\n\nNecha so\'m?\n<i>Masalan: 2 500 000</i>`, { reply_markup: KB_REMOVE });
+            return;
+        }
+
         // ── STATE MACHINE ─────────────────────────────────────
 
-
         // HARAJAT: summa
-        if (u.state === 'exp_amount' || u.state === 'exp_amount_voice') {
+        if (u.state === 'exp_amount') {
             const n = parseNum(text);
             if (n) {
                 u.pending.amount = n;
@@ -664,35 +648,32 @@ module.exports = async (req, res) => {
             return;
         }
 
-        // HARAJAT: izoh/toifa
+        // HARAJAT: toifa/izoh
         if (u.state === 'exp_desc') {
-            const amount = u.pending.amount;
+            const amount = u.pending?.amount;
             if (amount && text) {
-                if (!u.incomes) u.incomes = [];
-                u.expenses.push({ id: Date.now().toString(), amount, description: text, date: dateStr(), dateKey: today(), time: timeStr() });
+                u.expenses.push({ id:genId(), amount, description:text, date:dateStr(), dateKey:today(), time:timeStr() });
                 u.pending = {}; u.state = null;
                 await save();
 
                 const todayExp = u.expenses.filter(e=>e.dateKey===today()).reduce((s,e)=>s+e.amount,0);
-                const totalInc = u.incomes.reduce((s,i)=>s+i.amount,0);
+                const totalInc = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
                 const totalExp = u.expenses.reduce((s,e)=>s+e.amount,0);
                 const rem = totalInc - totalExp;
-
-                let balLine = '';
-                if (totalInc > 0) {
-                    balLine = rem >= 0
+                const balLine = totalInc > 0
+                    ? (rem >= 0
                         ? `\n━━━━━━━━━━━━━━━━\n✅ <b>Qolgan balans:</b> <code>${money(rem)}</code>`
-                        : `\n━━━━━━━━━━━━━━━━\n⚠️ <b>Balans:</b> <code>-${money(Math.abs(rem))}</code> (ortiqcha!)`;
-                }
+                        : `\n━━━━━━━━━━━━━━━━\n⚠️ <b>Qolgan:</b> <code>-${money(Math.abs(rem))}</code>`)
+                    : '';
 
                 await send(chatId,
-                    `✅ <b>Harajat saqlandi!</b>\n\n` +
-                    `💵 <b>Summa:</b> ${money(amount)}\n` +
-                    `📝 <b>Izoh:</b> ${esc(text)}\n` +
-                    `🕐 <b>Vaqt:</b> ${timeStr()}\n\n` +
-                    `📊 <b>Bugungi jami:</b> <code>${money(todayExp)}</code>${balLine}`,
+                    `✅ <b>Harajat saqlandi!</b>\n\n💵 ${money(amount)}  •  📝 ${esc(text)}  •  🕐 ${timeStr()}\n\n` +
+                    `📊 Bugungi jami: <code>${money(todayExp)}</code>${balLine}`,
                     { reply_markup: KB_MAIN }
                 );
+            } else {
+                u.state = null; await save();
+                await send(chatId, `❌ Bekor qilindi.`, { reply_markup: KB_MAIN });
             }
             return;
         }
@@ -704,36 +685,33 @@ module.exports = async (req, res) => {
                 u.pending.amount = n;
                 u.state = 'inc_desc';
                 await save();
-                await send(chatId, `💵 Miqdor: <b>${money(n)}</b>\n\n📝 Izoh kiriting:`, { reply_markup: KB_INCOME_CAT });
+                await send(chatId, `💵 <b>${money(n)}</b>\n\n📝 Izoh kiriting:`, { reply_markup: KB_INCOME_CAT });
             } else {
-                await send(chatId, `❗ Faqat <b>raqam</b> kiriting.\n<i>Masalan: 2500000</i>`);
+                await send(chatId, `❗ Faqat <b>raqam</b> kiriting.`);
             }
             return;
         }
 
         // KIRIM: izoh
         if (u.state === 'inc_desc') {
-            const amount = u.pending.amount;
+            const amount = u.pending?.amount;
             if (amount && text) {
                 if (!u.incomes) u.incomes = [];
-                u.incomes.push({ id: Date.now().toString(), amount, description: text, date: dateStr(), dateKey: today(), time: timeStr() });
+                u.incomes.push({ id:genId(), amount, description:text, date:dateStr(), dateKey:today(), time:timeStr() });
                 u.pending = {}; u.state = null;
                 await save();
 
                 const totalInc = u.incomes.reduce((s,i)=>s+i.amount,0);
                 const totalExp = u.expenses.reduce((s,e)=>s+e.amount,0);
-                const rem = totalInc - totalExp;
-
                 await send(chatId,
-                    `✅ <b>Kirim saqlandi!</b>\n\n` +
-                    `💵 <b>Summa:</b> ${money(amount)}\n` +
-                    `📝 <b>Izoh:</b> ${esc(text)}\n\n` +
-                    `━━━━━━━━━━━━━━━━\n` +
-                    `📥 <b>Jami kirim:</b>   <code>${money(totalInc)}</code>\n` +
-                    `📤 <b>Jami harajat:</b> <code>${money(totalExp)}</code>\n` +
-                    `✅ <b>Qolgan:</b>        <code>${money(rem)}</code>`,
+                    `✅ <b>Kirim saqlandi!</b>\n\n💵 ${money(amount)}  •  📝 ${esc(text)}\n\n` +
+                    `📥 Jami kirim: <code>${money(totalInc)}</code>\n📤 Jami harajat: <code>${money(totalExp)}</code>\n` +
+                    `✅ Qolgan: <code>${money(totalInc-totalExp)}</code>`,
                     { reply_markup: KB_MAIN }
                 );
+            } else {
+                u.state = null; await save();
+                await send(chatId, `❌ Bekor qilindi.`, { reply_markup: KB_MAIN });
             }
             return;
         }
@@ -743,7 +721,7 @@ module.exports = async (req, res) => {
             u.pending.title = text;
             u.state = 'task_priority';
             await save();
-            await send(chatId, `📝 <b>Vazifa:</b> <i>${esc(text)}</i>\n\n⚡ <b>Qay darajada zarur?</b>`, { reply_markup: KB_PRIORITY });
+            await send(chatId, `📝 <b>${esc(text)}</b>\n\n⚡ Muhimlik darajasini tanlang:`, { reply_markup: KB_PRIORITY });
             return;
         }
 
@@ -751,23 +729,20 @@ module.exports = async (req, res) => {
         if (u.state === 'task_priority') {
             let emoji='🟡', label='Muhim', priority='medium';
             if (text.includes('Juda Zarur')||text.includes('🔴')) { emoji='🔴'; label='Juda Zarur'; priority='high'; }
-            else if (text.includes('Oddiy')||text.includes('🟢')) { emoji='🟢'; label='Oddiy'; priority='low'; }
+            else if (text.includes('Oddiy')||text.includes('🟢'))  { emoji='🟢'; label='Oddiy'; priority='low'; }
             u.pending.priority = { emoji, label, priority };
             u.state = 'task_time';
             await save();
-            await send(chatId,
-                `${emoji} <b>${label}</b>\n\n🕐 <b>Qaysi soatga bajarilishi kerak?</b>`,
-                { reply_markup: KB_TIME }
-            );
+            await send(chatId, `${emoji} <b>${label}</b>\n\n🕐 Qaysi soatga bajarilishi kerak?`, { reply_markup: KB_TIME });
             return;
         }
 
         // VAZIFA: vaqt
         if (u.state === 'task_time') {
-            const { title, priority: pr } = u.pending;
-            const { emoji, label, priority } = pr || { emoji:'🟡', label:'Muhim', priority:'medium' };
-
+            const { title, priority:pr } = u.pending || {};
+            const { emoji='🟡', label='Muhim' } = pr || {};
             let deadlineTime=null, deadlineMinutes=null, reminderMinutes=null;
+
             if (text !== '📅 Vaqtsiz (eslatma yo\'q)') {
                 const m = text.replace('⏰','').trim().match(/^(\d{1,2}):(\d{2})$/);
                 if (m) {
@@ -775,50 +750,51 @@ module.exports = async (req, res) => {
                     if (h>=0&&h<=23&&min>=0&&min<=59) {
                         deadlineTime    = `${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}`;
                         deadlineMinutes = h*60+min;
-                        reminderMinutes = deadlineMinutes - 30;
+                        reminderMinutes = deadlineMinutes-30;
                     }
                 }
             }
 
             const task = {
-                id: Date.now().toString(), title, priority, emoji, label,
-                date: dateStr(), dateKey: today(), time: timeStr(),
+                id:genId(), title:title||'Vazifa', priority:pr?.priority||'medium', emoji, label,
+                date:dateStr(), dateKey:today(), time:timeStr(),
                 deadlineTime, deadlineMinutes, reminderMinutes,
-                reminderSent: false, deadlineSent: false, completed: false
+                reminderSent:false, deadlineSent:false, completed:false
             };
             u.tasks.push(task);
             u.pending = {}; u.state = null;
             await save();
 
-            let txt = `✅ <b>Vazifa qo\'shildi!</b>\n\n📌 <b>${esc(title)}</b>\n${emoji} ${label}`;
-            if (deadlineTime) txt += `\n🕐 ${deadlineTime} — eslatma 30 daqiqa oldin! ⏰`;
+            let txt = `✅ <b>Vazifa qo\'shildi!</b>\n\n📌 <b>${esc(task.title)}</b>\n${emoji} ${label}`;
+            if (deadlineTime) txt += `\n⏰ Eslatma: ${deadlineTime} dan 30 daqiqa oldin`;
             await send(chatId, txt, { reply_markup: KB_MAIN });
             return;
         }
 
-        // Raqam yozilsa — harajat sifatida qabul qil
-        if (isNumeric(text)) {
+        // Raqam yozilganda — to'g'ridan harajat sifatida qabul qil
+        if (isNumericText(text)) {
             const n = parseNum(text);
             if (n) {
                 u.pending = { amount: n };
                 u.state = 'exp_desc';
                 await save();
                 await send(chatId,
-                    `💰 Summa: <b>${money(n)}</b>\n\n❓ <b>Nima uchun sarflandi?</b>\nToifa tanlang yoki yozing:`,
+                    `💰 Summa: <b>${money(n)}</b>\n\n❓ Nima uchun sarflandi?\nToifa tanlang yoki yozing:`,
                     { reply_markup: KB_CATEGORY }
                 );
                 return;
             }
         }
 
-        // Default
+        // Noma'lum matn
         await send(chatId,
-            `💡 Harajat qo\'shish uchun raqam yozing yoki quyidagi tugmalardan foydalaning:`,
+            `💡 Harajat qo\'shish uchun summa yozing yoki tugmalardan foydalaning:`,
             { reply_markup: KB_MAIN }
         );
 
     } catch (err) {
-        console.error('Bot error:', err?.message || err);
+        console.error('[BOT ERROR]', err?.message || err);
+        try { await send(chatId, `⚠️ Xato yuz berdi. /start yozing.`, { reply_markup: KB_MAIN }); } catch(_){}
     }
 };
 
@@ -826,13 +802,12 @@ module.exports = async (req, res) => {
 //  CALLBACK QUERY HANDLER
 // ════════════════════════════════════════════════════════════
 async function handleCallback(cq) {
-    const chatId = cq.message.chat.id;
+    const chatId = String(cq.message.chat.id);
     const data   = cq.data || '';
     const name   = cq.from?.first_name || 'Foydalanuvchi';
     const u      = await getUser(chatId);
     const save   = () => putUser(chatId, u);
-
-    const ack = (text='') => tgReq('answerCallbackQuery', { callback_query_id: cq.id, text, show_alert: false });
+    const ack    = (text='') => tgReq('answerCallbackQuery', { callback_query_id:cq.id, text, show_alert:false });
 
     // Statistika
     if (['stat_today','stat_week','stat_month','stat_year'].includes(data)) {
@@ -850,12 +825,10 @@ async function handleCallback(cq) {
             t.completed = !t.completed;
             await save();
             await ack(t.completed ? '✅ Bajarildi!' : '↩️ Qayta ochildi');
-            await tgReq('editMessageText', {
-                chat_id: chatId, message_id: cq.message.message_id,
-                text: `${t.completed?'✅':'⏳'} <b>${esc(t.title)}</b>\n${t.emoji} ${t.label} | 🕐 ${t.time}`,
-                parse_mode: 'HTML',
-                reply_markup: { inline_keyboard: [[{ text: t.completed?'↩️ Qayta Ochish':'✅ Bajarildi', callback_data:`task_done_${id}` }]] }
-            });
+            await tryEdit(chatId, cq.message.message_id,
+                `${t.completed?'✅':'⏳'} <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}${t.deadlineTime ? ` | 🕐${t.deadlineTime}` : ''}`,
+                { reply_markup: { inline_keyboard:[[{ text:t.completed?'↩️ Qayta Ochish':'✅ Bajarildi', callback_data:`task_done_${id}` }]] } }
+            );
         }
         return;
     }
@@ -866,62 +839,52 @@ async function handleCallback(cq) {
         const t = (u.tasks||[]).find(t=>t.id===id);
         await ack('⏳ Keyinroq bajaring!');
         if (t) {
-            await tgReq('editMessageText', {
-                chat_id: chatId, message_id: cq.message.message_id,
-                text: `⏳ <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\n<i>Hali bajarilmadi.</i>`,
-                parse_mode: 'HTML',
-                reply_markup: { inline_keyboard: [[{ text:'✅ Bajarildi!', callback_data:`task_done_${id}` }]] }
-            });
-        }
-        return;
-    }
-
-    // Harajat o'chirish
-    if (data.startsWith('del_exp_')) {
-        const id = data.slice(8);
-        const exp = (u.expenses||[]).find(e=>e.id===id);
-        u.expenses = (u.expenses||[]).filter(e=>e.id!==id);
-        await save();
-        await ack("🗑 Harajat o'chirildi!");
-        // Xabarni o'chirish
-        try { await tgReq('deleteMessage', { chat_id: chatId, message_id: cq.message.message_id }); } catch(_){}
-        // Yangi balans ko'rsat
-        if (exp) {
-            const totalInc = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
-            const totalExp = (u.expenses||[]).reduce((s,e)=>s+e.amount,0);
-            const rem = totalInc - totalExp;
-            let balLine = totalInc > 0
-                ? (rem >= 0 ? `\n✅ <b>Yangi balans:</b> <code>${money(rem)}</code>` : `\n⚠️ <b>Yangi balans:</b> <code>-${money(Math.abs(rem))}</code>`)
-                : '';
-            await send(chatId,
-                `🗑 <b>O'chirildi:</b> ${esc(exp.description)} — <code>${money(exp.amount)}</code>${balLine}`
+            await tryEdit(chatId, cq.message.message_id,
+                `⏳ <b>${esc(t.title)}</b>\n${t.emoji} ${t.label}\n\n<i>Hali bajarilmadi.</i>`,
+                { reply_markup: { inline_keyboard:[[{ text:'✅ Bajarildi!',callback_data:`task_done_${id}` }]] } }
             );
         }
         return;
     }
 
-    // Harajat tahrirlash (o'chir + qayta kiritish so'ra)
-    if (data.startsWith('edit_exp_')) {
-        const id = data.slice(9);
+    // Harajat o'chirish
+    if (data.startsWith('del_')) {
+        const id  = data.slice(4);
         const exp = (u.expenses||[]).find(e=>e.id===id);
-        if (!exp) { await ack('Topilmadi'); return; }
-        // Eski harajatni o'chir
         u.expenses = (u.expenses||[]).filter(e=>e.id!==id);
-        // Yangi harajat kiritish holatiga o't
-        u.state = 'exp_amount';
-        u.pending = {};
         await save();
-        await ack('✏️ Tahrirlash...');
-        try { await tgReq('deleteMessage', { chat_id: chatId, message_id: cq.message.message_id }); } catch(_){}
-        await send(chatId,
-            `✏️ <b>Tahrirlash</b>\n\n` +
-            `Eski: <s>${esc(exp.description)}</s> — <code>${money(exp.amount)}</code>\n\n` +
-            `Yangi summasini kiriting:`,
-            { reply_markup: { remove_keyboard: true } }
-        );
+        await ack("🗑 O'chirildi!");
+        await tryDelete(chatId, cq.message.message_id);
+        if (exp) {
+            const totalInc = (u.incomes||[]).reduce((s,i)=>s+i.amount,0);
+            const totalExp = u.expenses.reduce((s,e)=>s+e.amount,0);
+            const rem = totalInc - totalExp;
+            const balLine = totalInc > 0
+                ? (rem>=0 ? `\n✅ Yangi balans: <code>${money(rem)}</code>` : `\n⚠️ Yangi balans: <code>-${money(Math.abs(rem))}</code>`)
+                : '';
+            await send(chatId, `🗑 <b>O\'chirildi:</b> ${esc(exp.description)} — <code>${money(exp.amount)}</code>${balLine}`);
+        }
         return;
     }
 
+    // Harajat tahrirlash
+    if (data.startsWith('edit_')) {
+        const id  = data.slice(5);
+        const exp = (u.expenses||[]).find(e=>e.id===id);
+        if (!exp) { await ack('Topilmadi'); return; }
+        u.expenses = (u.expenses||[]).filter(e=>e.id!==id);
+        u.state = 'exp_amount'; u.pending = {};
+        await save();
+        await ack('✏️ Tahrirlash...');
+        await tryDelete(chatId, cq.message.message_id);
+        await send(chatId,
+            `✏️ <b>Tahrirlash</b>\n\n` +
+            `🗑 O\'chirildi: <s>${esc(exp.description)}</s> — <code>${money(exp.amount)}</code>\n\n` +
+            `Yangi summasini kiriting:`,
+            { reply_markup: KB_REMOVE }
+        );
+        return;
+    }
 
     // Balans
     if (data === 'balance_refresh') {
@@ -933,7 +896,9 @@ async function handleCallback(cq) {
         await ack();
         u.state = 'inc_amount'; u.pending = {};
         await save();
-        await send(chatId, `💵 <b>Kirim Qo\'shish</b>\n\nNecha so\'m?\n<i>Masalan: 2 500 000</i>`, { reply_markup: { remove_keyboard: true } });
+        await send(chatId, `💵 <b>Kirim Qo\'shish</b>\n\nNecha so\'m?\n<i>Masalan: 2 500 000</i>`, { reply_markup: KB_REMOVE });
         return;
     }
+
+    await ack();
 }
