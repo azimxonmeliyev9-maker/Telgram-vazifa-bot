@@ -28,48 +28,8 @@ import {
   showSubscriptionRequiredMessage
 } from '../lib/paymentHandlers.js';
 import { isSubActive } from '../lib/subscriptionService.js';
+import { getUserAppData as getUserData, saveUserAppData as saveUserData } from '../lib/storage.js';
 
-// Vercel KV for User App Data (Expenses, Tasks, Incomes, State)
-let kv = null;
-try {
-  const kvModule = await import('@vercel/kv');
-  kv = kvModule.kv;
-} catch (_) {}
-if (!global.__user_store) global.__user_store = {};
-
-async function getUserData(userId) {
-  const sUserId = String(userId);
-  const defaultData = {
-    state: null,
-    pending: {},
-    expenses: [],
-    incomes: [],
-    tasks: []
-  };
-  if (kv) {
-    try {
-      const raw = await kv.get(`udata:${sUserId}`);
-      if (raw) {
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        return Object.assign(defaultData, parsed);
-      }
-    } catch (_) {}
-  }
-  if (!global.__user_store[sUserId]) {
-    global.__user_store[sUserId] = defaultData;
-  }
-  return global.__user_store[sUserId];
-}
-
-async function saveUserData(userId, data) {
-  const sUserId = String(userId);
-  if (kv) {
-    try {
-      await kv.set(`udata:${sUserId}`, JSON.stringify(data));
-    } catch (_) {}
-  }
-  global.__user_store[sUserId] = data;
-}
 
 // ─── HELPERS ──────────────────────────────────────────────────
 function parseNum(s) {
